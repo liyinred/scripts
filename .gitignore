@@ -1,0 +1,45 @@
+# Editor files
+.vscode/
+.idea/
+.DS_Store
+.trae/
+
+# Logs
+*.log
+
+# Environment files
+/.env
+*.local
+/.env.local
+/.env.*.local
+frontend/.env.local
+frontend/.env.*.local
+
+# Dependencies and build output
+node_modules/
+frontend/node_modules/
+dist/
+dist_docs/
+build/
+dist-ssr/
+package-lock.json
+cache/
+
+# Python cache and generated files
+*.pyc
+__pycache__/
+alembic/
+alembic.ini
+scripts/
+runtime/
+code-review/
+frontend_miniprogram/
+
+# Tooling
+.cursorrules
+
+# Frontend auto-generated files
+frontend/src/types/import/auto-imports.d.ts
+frontend/src/types/import/components.d.ts
+frontend/.auto-import.json
+DESIGN.md

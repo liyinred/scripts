@@ -1,0 +1,11 @@
+{
+  "devDependencies": {
+    "vitepress": "2.0.0-alpha.17"
+  },
+  "scripts": {
+    "dev": "vitepress dev docs --open",
+    "docs:dev": "vitepress dev docs --open",
+    "docs:build": "vitepress build docs && node scripts/zip-dist-docs.mjs",
+    "docs:preview": "vitepress preview docs"
+  }
+}

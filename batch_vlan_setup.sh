@@ -131,7 +131,7 @@ fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "错误：必须使用 root 权限查看持久化配置。" >&2
-    echo "例如：sudo batch_vlan_setup_show" >&2
+    echo "请切换到 root 用户后执行：batch_vlan_setup_show" >&2
     exit 1
 fi
 
@@ -167,7 +167,7 @@ done < "$APPLY_PATH"
 
 if (( record_count == 0 )); then
     echo "尚无可查看的持久化 VLAN 配置。"
-    echo "请先执行：sudo batch_vlan_setup"
+    echo "请先执行：batch_vlan_setup"
     exit 0
 fi
 
@@ -181,7 +181,7 @@ SHOW_COMMAND_BODY
 
     if ! cat > "$apply_temp" <<'EMPTY_APPLY'
 #!/usr/bin/env bash
-echo "尚未配置 VLAN，请先执行：sudo batch_vlan_setup"
+echo "尚未配置 VLAN，请先执行：batch_vlan_setup"
 EMPTY_APPLY
     then
         rm -f "$command_temp" "$show_command_temp" "$apply_temp" "$service_temp"
@@ -237,9 +237,13 @@ SERVICE_UNIT
 
     echo
     echo "安装完成。"
-    echo "配置命令：sudo batch_vlan_setup"
-    echo "查看命令：sudo batch_vlan_setup_show"
-    echo "服务状态：已启动并启用开机自启"
+    echo "配置命令：batch_vlan_setup"
+    echo "查看命令：batch_vlan_setup_show"
+    echo "服务名称：${SERVICE_NAME}"
+    echo "运行状态：$(systemctl is-active "$SERVICE_NAME")"
+    echo "开机自启：$(systemctl is-enabled "$SERVICE_NAME")"
+    echo "状态命令：systemctl status ${SERVICE_NAME}"
+    echo "日志命令：journalctl -u ${SERVICE_NAME} -b"
 }
 
 
@@ -262,7 +266,7 @@ fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "错误：必须使用 root 权限执行。"
-    echo "例如：sudo batch_vlan_setup"
+    echo "请切换到 root 用户后执行：batch_vlan_setup"
     exit 1
 fi
 
@@ -1502,7 +1506,7 @@ fi
 
 echo "服务名称：${SERVICE_NAME}"
 echo "开机配置：已保存并验证"
-echo "查看配置：sudo batch_vlan_setup_show"
+echo "查看配置：batch_vlan_setup_show"
 echo
 
 

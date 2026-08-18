@@ -19,21 +19,16 @@ set -euo pipefail
 #   2. 用户选择父接口
 #   3. 输入 VLAN 起始 / 结束 ID
 #   4. 列出父接口下将被全量替换的现有 VLAN
-#   5. 输入默认 IPv4 / IPv6 前缀长度
-#   6. 一次性粘贴接口、IPv4、IPv6 映射
-#   7. 校验映射完整性
-#   8. 显示完整执行计划
-#   9. 批量创建 VLAN 并绑定 IP
-#  10. 保存配置供 systemd 开机重放
+#   5. 一次性粘贴接口、IPv4 CIDR、IPv4 网关、IPv6 CIDR、IPv6 网关映射
+#   6. 校验映射完整性和策略路由冲突
+#   7. 显示完整执行计划
+#   8. 批量创建 VLAN、绑定 IP 并配置策略路由
+#   9. 保存配置供 systemd 开机重放
 #
 # 映射输入格式：
 #
-# eth0.202    117.156.130.194    2409:8774:122F::B3
-# eth0.203    117.156.130.195    2409:8774:122F::B4
-#
-# 如果 IP 自己带前缀，则优先使用：
-#
-# eth0.202    117.156.130.194/29    2409:8774:122F::B3/64
+# eth0.202  117.156.130.194/29  117.156.130.193  2409:8774:122F::B3/64  2409:8774:122F::1
+# eth0.203  117.156.131.195/24  117.156.131.1    2409:8774:1230::B4/64  2409:8774:1230::1
 #
 # ============================================================
 
@@ -48,6 +43,10 @@ COMMAND_PATH="/usr/local/bin/batch_vlan_setup"
 SHOW_COMMAND_PATH="/usr/local/bin/batch_vlan_setup_show"
 ENGINE_PATH="/usr/local/libexec/batch_vlan_setup"
 APPLY_PATH="/usr/local/libexec/batch_vlan_setup_apply"
+IPV4_TABLE_BASE=3250
+IPV6_TABLE_BASE=4250
+IPV4_POLICY_PRIORITY=1000
+IPV6_POLICY_PRIORITY=1000
 
 
 # 功能：替换同名服务并安装配置、查看命令及开机服务。
@@ -142,12 +141,25 @@ fi
 
 record_count=0
 
-while IFS=$'\t' read -r marker parent_if vlan_id vlan_if mac ipv4 ipv6 extra; do
-    [[ "$marker" == "# BATCH_VLAN_CONFIG_V1" ]] || continue
+while IFS=$'\t' read -r \
+    marker parent_if vlan_id vlan_if mac ipv4 ipv6 \
+    ipv4_network ipv6_network ipv4_gateway ipv6_gateway \
+    ipv4_table ipv6_table ipv4_priority ipv6_priority extra; do
+    [[ "$marker" == "# BATCH_VLAN_CONFIG_V1" ||
+       "$marker" == "# BATCH_VLAN_CONFIG_V2" ]] || continue
 
     if [[ -z "$parent_if" || -z "$vlan_id" || -z "$vlan_if" ||
           -z "$mac" || -z "$ipv4" || -z "$ipv6" || -n "$extra" ]]; then
         echo "错误：持久化配置格式损坏。" >&2
+        exit 1
+    fi
+
+    if [[ "$marker" == "# BATCH_VLAN_CONFIG_V2" ]] &&
+       [[ -z "$ipv4_network" || -z "$ipv6_network" ||
+          -z "$ipv4_gateway" || -z "$ipv6_gateway" ||
+          -z "$ipv4_table" || -z "$ipv6_table" ||
+          -z "$ipv4_priority" || -z "$ipv6_priority" ]]; then
+        echo "错误：持久化策略路由配置格式损坏。" >&2
         exit 1
     fi
 
@@ -162,6 +174,13 @@ while IFS=$'\t' read -r marker parent_if vlan_id vlan_if mac ipv4 ipv6 extra; do
 
     printf "%-16s %-6s %-16s %-20s %-22s %-42s\n" \
         "$parent_if" "$vlan_id" "$vlan_if" "$mac" "$ipv4" "$ipv6"
+
+    if [[ "$marker" == "# BATCH_VLAN_CONFIG_V2" ]]; then
+        printf "  IPv4 policy: gateway=%s table=%s priority=%s network=%s\n" \
+            "$ipv4_gateway" "$ipv4_table" "$ipv4_priority" "$ipv4_network"
+        printf "  IPv6 policy: gateway=%s table=%s priority=%s network=%s\n" \
+            "$ipv6_gateway" "$ipv6_table" "$ipv6_priority" "$ipv6_network"
+    fi
     ((record_count+=1))
 done < "$APPLY_PATH"
 
@@ -270,7 +289,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-for CMD in ip awk sed cut paste basename tr sort grep cat head \
+for CMD in ip awk sed cut paste basename tr sort grep cat head sleep \
            mktemp install rm systemctl; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         echo "错误：缺少必要命令：$CMD"
@@ -443,21 +462,19 @@ normalize_ipv4_address()
 }
 
 
-# 功能：校验 IPv4 地址及 CIDR 前缀，并补充缺省前缀。
-# 参数：$1 为 IPv4 地址，$2 为缺省 CIDR 前缀。
+# 功能：校验并规范化必须携带前缀的 IPv4 CIDR。
+# 参数：$1 为必须包含 CIDR 前缀的 IPv4 地址。
 # 返回值：成功时输出规范化 CIDR 并返回 0，格式无效时返回 1。
 normalize_ipv4_cidr()
 {
     local value="$1"
-    local default_prefix="$2"
-    local address="$value"
-    local prefix="$default_prefix"
+    local address
+    local prefix
     local normalized_address
 
-    if [[ "$value" == */* ]]; then
-        address="${value%/*}"
-        prefix="${value##*/}"
-    fi
+    [[ "$value" == */* ]] || return 1
+    address="${value%/*}"
+    prefix="${value##*/}"
 
     [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
     (( 10#$prefix <= 32 )) || return 1
@@ -467,15 +484,14 @@ normalize_ipv4_cidr()
 }
 
 
-# 功能：校验 IPv6 地址及 CIDR 前缀，展开为统一的 8 组十六进制格式。
-# 参数：$1 为 IPv6 地址，$2 为缺省 CIDR 前缀。
+# 功能：校验必须携带前缀的 IPv6 CIDR，并展开为统一的 8 组格式。
+# 参数：$1 为必须包含 CIDR 前缀的 IPv6 地址。
 # 返回值：成功时输出规范化 CIDR 并返回 0，格式无效时返回 1。
 normalize_ipv6_cidr()
 {
     local value="$1"
-    local default_prefix="$2"
-    local address="$value"
-    local prefix="$default_prefix"
+    local address
+    local prefix
     local ipv4_suffix normalized_ipv4
     local ipv4_a ipv4_b ipv4_c ipv4_d ipv4_high ipv4_low
     local left right remainder group normalized_group
@@ -485,10 +501,9 @@ normalize_ipv6_cidr()
     local -a address_groups=()
     local -a normalized_groups=()
 
-    if [[ "$value" == */* ]]; then
-        address="${value%/*}"
-        prefix="${value##*/}"
-    fi
+    [[ "$value" == */* ]] || return 1
+    address="${value%/*}"
+    prefix="${value##*/}"
 
     [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
     (( 10#$prefix <= 128 )) || return 1
@@ -549,13 +564,252 @@ normalize_ipv6_cidr()
 }
 
 
-# 功能：根据已确认的 VLAN 计划保存 systemd 开机重放程序。
-# 参数：无；读取 PARENT_IF、VLAN 范围及地址映射等全局配置。
+# 功能：根据 IPv4 CIDR 计算规范化的直连网段。
+# 参数：$1 为已经规范化的 IPv4 CIDR。
+# 返回值：成功时输出网段 CIDR，输入无效时返回 1。
+calculate_ipv4_network()
+{
+    local cidr="$1"
+    local address="${cidr%/*}"
+    local prefix="${cidr##*/}"
+    local a b c d address_value mask network_value
+
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( prefix >= 0 && prefix <= 32 )) || return 1
+    IFS='.' read -r a b c d <<< "$address"
+
+    address_value=$((a << 24 | b << 16 | c << 8 | d))
+    if (( prefix == 0 )); then
+        mask=0
+    else
+        mask=$((0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF))
+    fi
+    network_value=$((address_value & mask))
+
+    printf '%d.%d.%d.%d/%d\n' \
+        "$((network_value >> 24 & 255))" \
+        "$((network_value >> 16 & 255))" \
+        "$((network_value >> 8 & 255))" \
+        "$((network_value & 255))" \
+        "$prefix"
+}
+
+
+# 功能：根据 IPv6 CIDR 计算展开格式的直连网段。
+# 参数：$1 为已经规范化的 IPv6 CIDR。
+# 返回值：成功时输出网段 CIDR，输入无效时返回 1。
+calculate_ipv6_network()
+{
+    local cidr="$1"
+    local address="${cidr%/*}"
+    local prefix="${cidr##*/}"
+    local remaining_bits group group_value network_group
+    local -a groups=()
+    local -a network_groups=()
+
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( prefix >= 0 && prefix <= 128 )) || return 1
+    IFS=':' read -r -a groups <<< "$address"
+    (( ${#groups[@]} == 8 )) || return 1
+
+    remaining_bits=$prefix
+    for group in "${groups[@]}"; do
+        group_value=$((16#$group))
+        if (( remaining_bits >= 16 )); then
+            network_group=$group_value
+        elif (( remaining_bits <= 0 )); then
+            network_group=0
+        else
+            network_group=$((
+                group_value & (0xFFFF << (16 - remaining_bits) & 0xFFFF)
+            ))
+        fi
+        printf -v network_group '%04x' "$network_group"
+        network_groups+=("$network_group")
+        (( remaining_bits-=16 )) || true
+    done
+
+    local IFS=':'
+    printf '%s/%d\n' "${network_groups[*]}" "$prefix"
+}
+
+
+# 功能：判断规范化 IPv6 地址是否属于 link-local 前缀 fe80::/10。
+# 参数：$1 为展开格式且不含 CIDR 的 IPv6 地址。
+# 返回值：属于 link-local 时返回 0，否则返回 1。
+is_ipv6_link_local()
+{
+    local address="$1"
+    local first_group="${address%%:*}"
+
+    (( (16#$first_group & 0xFFC0) == 0xFE80 ))
+}
+
+
+# 功能：删除一个 VLAN 对应的 IPv4 和 IPv6 策略路由。
+# 参数：依次为接口源 IPv4、源 IPv6、IPv4/IPv6 表号和 priority。
+# 返回值：始终返回 0；不存在的规则或路由表会被忽略。
+remove_policy_routing()
+{
+    local ipv4_source="$1"
+    local ipv6_source="$2"
+    local ipv4_table="$3"
+    local ipv6_table="$4"
+    local ipv4_priority="$5"
+    local ipv6_priority="$6"
+
+    while ip -4 rule del \
+        from "${ipv4_source}/32" \
+        table "$ipv4_table" \
+        priority "$ipv4_priority" 2>/dev/null; do
+        :
+    done
+    while ip -6 rule del \
+        from "${ipv6_source}/128" \
+        table "$ipv6_table" \
+        priority "$ipv6_priority" 2>/dev/null; do
+        :
+    done
+    ip -4 route flush table "$ipv4_table" 2>/dev/null || true
+    ip -6 route flush table "$ipv6_table" 2>/dev/null || true
+}
+
+
+# 功能：等待指定接口上的目标 IPv6 地址完成 DAD。
+# 参数：$1 为接口名称，$2 为已经规范化的 IPv6 CIDR。
+# 返回值：DAD 成功完成时返回 0，地址缺失、DAD 失败或等待超时时返回 1。
+wait_for_ipv6_dad()
+{
+    local vlan_if="$1"
+    local ipv6_cidr="$2"
+    local ipv6_source="${ipv6_cidr%/*}"
+    local expected_address="${ipv6_source//:/}"
+    local max_attempts=100
+    local attempt
+    local record_address ifindex prefix_length scope flags interface_name
+    local flags_value
+    local address_found
+
+    expected_address="${expected_address,,}"
+
+    for ((attempt=0; attempt<max_attempts; attempt++)); do
+        address_found=0
+
+        while read -r \
+            record_address ifindex prefix_length scope flags interface_name; do
+            [[ "$interface_name" == "$vlan_if" ]] || continue
+            [[ "${record_address,,}" == "$expected_address" ]] || continue
+
+            address_found=1
+            flags_value=$((16#$flags))
+
+            if (( flags_value & 0x08 )); then
+                echo "错误：${vlan_if} 的 IPv6 地址 ${ipv6_source} DAD 失败。" >&2
+                return 1
+            fi
+
+            if (( (flags_value & 0x40) == 0 )); then
+                return 0
+            fi
+
+            break
+        done < /proc/net/if_inet6
+
+        sleep 0.1
+    done
+
+    if (( address_found == 0 )); then
+        echo "错误：未在 ${vlan_if} 上找到 IPv6 地址 ${ipv6_source}。" >&2
+    else
+        echo "错误：等待 ${vlan_if} 的 IPv6 地址 ${ipv6_source} 完成 DAD 超时。" >&2
+    fi
+    return 1
+}
+
+
+# 功能：为一个 VLAN 幂等配置 IPv4 和 IPv6 源地址策略路由。
+# 参数：依次为接口、IPv4/IPv6 CIDR、直连网段、网关、表号和 priority。
+# 返回值：配置成功时返回 0，命令失败时返回非 0。
+ensure_policy_routing()
+{
+    local vlan_if="$1"
+    local ipv4_cidr="$2"
+    local ipv6_cidr="$3"
+    local ipv4_network="$4"
+    local ipv6_network="$5"
+    local ipv4_gateway="$6"
+    local ipv6_gateway="$7"
+    local ipv4_table="$8"
+    local ipv6_table="$9"
+    local ipv4_priority="${10}"
+    local ipv6_priority="${11}"
+    local ipv4_source="${ipv4_cidr%/*}"
+    local ipv6_source="${ipv6_cidr%/*}"
+
+    wait_for_ipv6_dad "$vlan_if" "$ipv6_cidr" || return 1
+
+    while ip -4 rule del \
+        from "${ipv4_source}/32" \
+        table "$ipv4_table" \
+        priority "$ipv4_priority" 2>/dev/null; do
+        :
+    done
+    while ip -6 rule del \
+        from "${ipv6_source}/128" \
+        table "$ipv6_table" \
+        priority "$ipv6_priority" 2>/dev/null; do
+        :
+    done
+
+    CONFIGURED_POLICIES+=(
+        "${ipv4_source}"$'\t'"${ipv6_source}"$'\t' \
+        "${ipv4_table}"$'\t'"${ipv6_table}"$'\t' \
+        "${ipv4_priority}"$'\t'"${ipv6_priority}"
+    )
+
+    ip -4 route flush table "$ipv4_table" 2>/dev/null || true
+    ip -6 route flush table "$ipv6_table" 2>/dev/null || true
+
+    ip -4 route replace \
+        "$ipv4_network" \
+        dev "$vlan_if" \
+        src "$ipv4_source" \
+        table "$ipv4_table"
+    ip -4 route replace \
+        default \
+        via "$ipv4_gateway" \
+        dev "$vlan_if" \
+        table "$ipv4_table"
+    ip -4 rule add \
+        from "${ipv4_source}/32" \
+        table "$ipv4_table" \
+        priority "$ipv4_priority"
+
+    ip -6 route replace \
+        "$ipv6_network" \
+        dev "$vlan_if" \
+        src "$ipv6_source" \
+        table "$ipv6_table"
+    ip -6 route replace \
+        default \
+        via "$ipv6_gateway" \
+        dev "$vlan_if" \
+        table "$ipv6_table"
+    ip -6 rule add \
+        from "${ipv6_source}/128" \
+        table "$ipv6_table" \
+        priority "$ipv6_priority"
+}
+
+
+# 功能：根据已确认的 VLAN 和策略路由计划保存 systemd 开机重放程序。
+# 参数：无；读取 VLAN 范围、逐接口地址及网关映射和编号基数等全局配置。
 # 返回值：保存并验证成功时返回 0，生成或服务重启失败时返回非 0。
 save_apply_configuration()
 {
     local apply_temp
-    local vlan_id vlan_if vlan_mac
+    local vlan_id vlan_if vlan_mac policy_index
+    local ipv4_table ipv6_table ipv4_priority ipv6_priority
 
     apply_temp=$(mktemp) || return 1
 
@@ -592,14 +846,31 @@ get_vlan_id()
 
 
 declare -a CREATED_INTERFACES=()
+declare -a CONFIGURED_POLICIES=()
 
 
-# 功能：删除本次执行中新建的 VLAN 接口。
-# 参数：无；读取 CREATED_INTERFACES 数组。
+# 功能：删除本次执行新增的策略路由和 VLAN 接口。
+# 参数：无；读取 CONFIGURED_POLICIES 和 CREATED_INTERFACES 数组。
 # 返回值：始终返回 0。
 rollback()
 {
-    local vlan_if
+    local vlan_if policy_record
+    local ipv4_source ipv6_source ipv4_table ipv6_table
+    local ipv4_priority ipv6_priority
+
+    for policy_record in "${CONFIGURED_POLICIES[@]:-}"; do
+        [[ -z "$policy_record" ]] && continue
+        IFS=$'\t' read -r \
+            ipv4_source ipv6_source ipv4_table ipv6_table \
+            ipv4_priority ipv6_priority <<< "$policy_record"
+        remove_policy_routing \
+            "$ipv4_source" \
+            "$ipv6_source" \
+            "$ipv4_table" \
+            "$ipv6_table" \
+            "$ipv4_priority" \
+            "$ipv6_priority"
+    done
 
     for vlan_if in "${CREATED_INTERFACES[@]:-}"; do
         [[ -z "$vlan_if" ]] && continue
@@ -653,7 +924,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-for command_name in ip awk sed cut head; do
+for command_name in ip awk sed cut head sleep; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "错误：缺少必要命令：${command_name}" >&2
         exit 1
@@ -662,6 +933,30 @@ done
 
 trap 'rollback' ERR
 COMMAND_HEADER
+
+        cat <<'POLICY_FUNCTION_COMMENTS'
+
+# 功能：删除一个 VLAN 对应的 IPv4 和 IPv6 策略路由。
+# 参数：依次为接口源 IPv4、源 IPv6、IPv4/IPv6 表号和 priority。
+# 返回值：始终返回 0；不存在的规则或路由表会被忽略。
+POLICY_FUNCTION_COMMENTS
+        declare -f remove_policy_routing
+
+        cat <<'IPV6_DAD_WAIT_COMMENTS'
+
+# 功能：等待指定接口上的目标 IPv6 地址完成 DAD。
+# 参数：$1 为接口名称，$2 为已经规范化的 IPv6 CIDR。
+# 返回值：DAD 成功完成时返回 0，地址缺失、DAD 失败或等待超时时返回 1。
+IPV6_DAD_WAIT_COMMENTS
+        declare -f wait_for_ipv6_dad
+
+        cat <<'POLICY_ENSURE_COMMENTS'
+
+# 功能：为一个 VLAN 幂等配置 IPv4 和 IPv6 源地址策略路由。
+# 参数：依次为接口、IPv4/IPv6 CIDR、直连网段、网关、表号和 priority。
+# 返回值：配置成功时返回 0，命令失败时返回非 0。
+POLICY_ENSURE_COMMENTS
+        declare -f ensure_policy_routing
 
         printf 'PARENT_IF=%q\n' "$PARENT_IF"
 
@@ -678,14 +973,27 @@ COMMAND_SETUP
         for ((vlan_id=VLAN_START; vlan_id<=VLAN_END; vlan_id++)); do
             vlan_if="${PARENT_IF}.${vlan_id}"
             vlan_mac=$(generate_vlan_mac "$BASE_MAC" "$vlan_id")
+            policy_index=$((vlan_id - VLAN_START))
+            ipv4_table=$((IPV4_TABLE_BASE + policy_index))
+            ipv6_table=$((IPV6_TABLE_BASE + policy_index))
+            ipv4_priority=$IPV4_POLICY_PRIORITY
+            ipv6_priority=$IPV6_POLICY_PRIORITY
 
-            printf '# BATCH_VLAN_CONFIG_V1\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '# BATCH_VLAN_CONFIG_V2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$PARENT_IF" \
                 "$vlan_id" \
                 "$vlan_if" \
                 "$vlan_mac" \
                 "${MAP_IPV4[$vlan_if]}" \
-                "${MAP_IPV6[$vlan_if]}"
+                "${MAP_IPV6[$vlan_if]}" \
+                "${MAP_IPV4_NETWORK[$vlan_if]}" \
+                "${MAP_IPV6_NETWORK[$vlan_if]}" \
+                "${MAP_IPV4_GATEWAY[$vlan_if]}" \
+                "${MAP_IPV6_GATEWAY[$vlan_if]}" \
+                "$ipv4_table" \
+                "$ipv6_table" \
+                "$ipv4_priority" \
+                "$ipv6_priority"
 
             printf 'ensure_vlan %q %q %q %q %q %q\n' \
                 "$PARENT_IF" \
@@ -694,6 +1002,19 @@ COMMAND_SETUP
                 "$vlan_mac" \
                 "${MAP_IPV4[$vlan_if]}" \
                 "${MAP_IPV6[$vlan_if]}"
+
+            printf 'ensure_policy_routing %q %q %q %q %q %q %q %q %q %q %q\n' \
+                "$vlan_if" \
+                "${MAP_IPV4[$vlan_if]}" \
+                "${MAP_IPV6[$vlan_if]}" \
+                "${MAP_IPV4_NETWORK[$vlan_if]}" \
+                "${MAP_IPV6_NETWORK[$vlan_if]}" \
+                "${MAP_IPV4_GATEWAY[$vlan_if]}" \
+                "${MAP_IPV6_GATEWAY[$vlan_if]}" \
+                "$ipv4_table" \
+                "$ipv6_table" \
+                "$ipv4_priority" \
+                "$ipv6_priority"
         done
 
         cat <<'COMMAND_FOOTER'
@@ -898,60 +1219,86 @@ echo "VLAN 检查通过。"
 
 
 # ============================================================
-# 输入默认前缀长度
-#
-# 映射中如果 IP 自带 /xx，则使用自带值。
+# 检查策略路由表编号冲突
 # ============================================================
 
 echo
 echo "======================================================================"
-echo "设置默认 IP 前缀"
+echo "检查策略路由表编号冲突"
 echo "======================================================================"
 echo
-echo "映射表中的 IP 如果不包含 CIDR，则使用这里设置的前缀。"
-echo
 
-while true; do
-    read -r -p "请输入默认 IPv4 前缀长度，例如 24: " IPV4_PREFIX
+declare -A OWNED_IPV4_TABLES=()
+declare -A OWNED_IPV6_TABLES=()
 
-    if [[ "$IPV4_PREFIX" =~ ^[0-9]+$ ]] &&
-       (( IPV4_PREFIX >= 0 && IPV4_PREFIX <= 32 )); then
-        break
+if [[ -r "$APPLY_PATH" ]]; then
+    while IFS=$'\t' read -r \
+        MARKER OLD_PARENT OLD_VLAN_ID OLD_VLAN_IF OLD_MAC \
+        OLD_IPV4 OLD_IPV6 OLD_IPV4_NETWORK OLD_IPV6_NETWORK \
+        OLD_IPV4_GATEWAY OLD_IPV6_GATEWAY OLD_IPV4_TABLE OLD_IPV6_TABLE \
+        OLD_IPV4_PRIORITY OLD_IPV6_PRIORITY OLD_EXTRA; do
+        [[ "$MARKER" == "# BATCH_VLAN_CONFIG_V2" ]] || continue
+        if [[ -z "$OLD_IPV4_TABLE" || -z "$OLD_IPV6_TABLE" ||
+              -z "$OLD_IPV4_PRIORITY" || -z "$OLD_IPV6_PRIORITY" ||
+              -n "$OLD_EXTRA" ]]; then
+            echo "错误：旧持久化策略路由配置格式损坏。"
+            exit 1
+        fi
+        OWNED_IPV4_TABLES["$OLD_IPV4_TABLE"]=1
+        OWNED_IPV6_TABLES["$OLD_IPV6_TABLE"]=1
+    done < "$APPLY_PATH"
+fi
+
+POLICY_CONFLICT=0
+
+for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
+    POLICY_INDEX=$((VLAN_ID - VLAN_START))
+    IPV4_TABLE=$((IPV4_TABLE_BASE + POLICY_INDEX))
+    IPV6_TABLE=$((IPV6_TABLE_BASE + POLICY_INDEX))
+
+    IPV4_TABLE_ROUTES=$(ip -4 route show table "$IPV4_TABLE" 2>/dev/null || true)
+    IPV6_TABLE_ROUTES=$(ip -6 route show table "$IPV6_TABLE" 2>/dev/null || true)
+
+    if [[ -n "$IPV4_TABLE_ROUTES" &&
+          -z "${OWNED_IPV4_TABLES[$IPV4_TABLE]+x}" ]]; then
+        echo "IPv4 路由表 ${IPV4_TABLE} 已被其他配置占用。"
+        POLICY_CONFLICT=1
     fi
-
-    echo "错误：IPv4 前缀必须为 0-32。"
+    if [[ -n "$IPV6_TABLE_ROUTES" &&
+          -z "${OWNED_IPV6_TABLES[$IPV6_TABLE]+x}" ]]; then
+        echo "IPv6 路由表 ${IPV6_TABLE} 已被其他配置占用。"
+        POLICY_CONFLICT=1
+    fi
 done
 
-while true; do
-    read -r -p "请输入默认 IPv6 前缀长度，例如 64: " IPV6_PREFIX
+if (( POLICY_CONFLICT == 1 )); then
+    echo
+    echo "策略路由表编号存在冲突，本次操作终止。"
+    exit 1
+fi
 
-    if [[ "$IPV6_PREFIX" =~ ^[0-9]+$ ]] &&
-       (( IPV6_PREFIX >= 0 && IPV6_PREFIX <= 128 )); then
-        break
-    fi
-
-    echo "错误：IPv6 前缀必须为 0-128。"
-done
+echo "策略路由表编号检查通过。"
 
 
 # ============================================================
-# 输入接口 / IPv4 / IPv6 映射
+# 输入接口 / IP / 网关映射
 # ============================================================
 
 echo
 echo "======================================================================"
-echo "请输入 VLAN IP 映射"
+echo "请输入 VLAN IP 与网关映射"
 echo "======================================================================"
 echo
 echo "格式："
 echo
-echo "接口名    IPv4    IPv6"
+echo "接口名    IPv4 CIDR    IPv4网关    IPv6 CIDR    IPv6网关"
 echo
 echo "例如："
 echo
-echo "${PARENT_IF}.202    117.156.130.194    2409:8774:122F::B3"
-echo "${PARENT_IF}.203    117.156.130.195    2409:8774:122F::B4"
+echo "${PARENT_IF}.202  117.156.130.194/29  117.156.130.193  2409:8774:122F::B3/64  2409:8774:122F::1"
+echo "${PARENT_IF}.203  117.156.131.195/24  117.156.131.1    2409:8774:1230::B4/64  2409:8774:1230::1"
 echo
+echo "IPv4 和 IPv6 地址必须携带 CIDR 前缀；网关不得携带前缀。"
 echo "支持空格或 TAB 分隔。"
 echo "粘贴全部内容后，再输入一个空行结束。"
 echo
@@ -959,6 +1306,10 @@ echo
 
 declare -A MAP_IPV4
 declare -A MAP_IPV6
+declare -A MAP_IPV4_NETWORK
+declare -A MAP_IPV6_NETWORK
+declare -A MAP_IPV4_GATEWAY
+declare -A MAP_IPV6_GATEWAY
 declare -A SEEN_IFACE
 
 INPUT_COUNT=0
@@ -974,23 +1325,28 @@ while IFS= read -r LINE; do
 
     IFACE=""
     IPV4=""
+    IPV4_GATEWAY_INPUT=""
     IPV6=""
+    IPV6_GATEWAY_INPUT=""
     EXTRA=""
 
-    read -r IFACE IPV4 IPV6 EXTRA <<< "$LINE"
+    read -r \
+        IFACE IPV4 IPV4_GATEWAY_INPUT IPV6 IPV6_GATEWAY_INPUT EXTRA \
+        <<< "$LINE"
 
-    if [[ -z "$IFACE" || -z "$IPV4" || -z "$IPV6" ]]; then
+    if [[ -z "$IFACE" || -z "$IPV4" || -z "$IPV4_GATEWAY_INPUT" ||
+          -z "$IPV6" || -z "$IPV6_GATEWAY_INPUT" ]]; then
         echo
         echo "错误：格式不正确："
         echo "  $LINE"
         echo
-        echo "每行必须包含：接口名 IPv4 IPv6"
+        echo "每行必须包含：接口名 IPv4-CIDR IPv4网关 IPv6-CIDR IPv6网关"
         exit 1
     fi
 
     if [[ -n "$EXTRA" ]]; then
         echo
-        echo "错误：每行只能有 3 列："
+        echo "错误：每行只能有 5 列："
         echo "  $LINE"
         exit 1
     fi
@@ -1036,26 +1392,77 @@ while IFS= read -r LINE; do
 
 
     # --------------------------------------------------------
-    # IPv4 / IPv6 格式验证并标准化
+    # IPv4 / IPv6 地址及网关验证并标准化
     # --------------------------------------------------------
 
-    if ! NORMALIZED_IPV4=$(normalize_ipv4_cidr "$IPV4" "$IPV4_PREFIX"); then
+    if ! NORMALIZED_IPV4=$(normalize_ipv4_cidr "$IPV4"); then
         echo
-        echo "错误：IPv4 地址格式无效："
+        echo "错误：IPv4 地址必须是携带 CIDR 前缀的有效地址："
         echo "  ${LINE}"
         exit 1
     fi
 
-    if ! NORMALIZED_IPV6=$(normalize_ipv6_cidr "$IPV6" "$IPV6_PREFIX"); then
+    if ! NORMALIZED_IPV6=$(normalize_ipv6_cidr "$IPV6"); then
         echo
-        echo "错误：IPv6 地址格式无效："
+        echo "错误：IPv6 地址必须是携带 CIDR 前缀的有效地址："
         echo "  ${LINE}"
+        exit 1
+    fi
+
+    if ! NORMALIZED_IPV4_GATEWAY=$(
+        normalize_ipv4_address "$IPV4_GATEWAY_INPUT"
+    ); then
+        echo
+        echo "错误：IPv4 网关格式无效："
+        echo "  ${LINE}"
+        exit 1
+    fi
+
+    if ! NORMALIZED_IPV6_GATEWAY_CIDR=$(
+        normalize_ipv6_cidr "${IPV6_GATEWAY_INPUT}/128"
+    ); then
+        echo
+        echo "错误：IPv6 网关格式无效："
+        echo "  ${LINE}"
+        exit 1
+    fi
+    NORMALIZED_IPV6_GATEWAY="${NORMALIZED_IPV6_GATEWAY_CIDR%/*}"
+
+    IPV4_NETWORK=$(calculate_ipv4_network "$NORMALIZED_IPV4")
+    IPV6_NETWORK=$(calculate_ipv6_network "$NORMALIZED_IPV6")
+    IPV4_GATEWAY_NETWORK=$(
+        calculate_ipv4_network \
+            "${NORMALIZED_IPV4_GATEWAY}/${NORMALIZED_IPV4##*/}"
+    )
+    IPV6_GATEWAY_NETWORK=$(
+        calculate_ipv6_network \
+            "${NORMALIZED_IPV6_GATEWAY}/${NORMALIZED_IPV6##*/}"
+    )
+
+    if [[ "$IPV4_GATEWAY_NETWORK" != "$IPV4_NETWORK" ]]; then
+        echo
+        echo "错误：IPv4 网关 ${NORMALIZED_IPV4_GATEWAY} 不在"
+        echo "${IFACE} 的直连网段内："
+        echo "  ${IPV4_NETWORK}"
+        exit 1
+    fi
+
+    if ! is_ipv6_link_local "$NORMALIZED_IPV6_GATEWAY" &&
+       [[ "$IPV6_GATEWAY_NETWORK" != "$IPV6_NETWORK" ]]; then
+        echo
+        echo "错误：IPv6 网关 ${NORMALIZED_IPV6_GATEWAY} 不是 link-local 地址，且不在"
+        echo "${IFACE} 的直连网段内："
+        echo "  ${IPV6_NETWORK}"
         exit 1
     fi
 
 
     MAP_IPV4["$IFACE"]="$NORMALIZED_IPV4"
     MAP_IPV6["$IFACE"]="$NORMALIZED_IPV6"
+    MAP_IPV4_NETWORK["$IFACE"]="$IPV4_NETWORK"
+    MAP_IPV6_NETWORK["$IFACE"]="$IPV6_NETWORK"
+    MAP_IPV4_GATEWAY["$IFACE"]="$NORMALIZED_IPV4_GATEWAY"
+    MAP_IPV6_GATEWAY["$IFACE"]="$NORMALIZED_IPV6_GATEWAY"
     SEEN_IFACE["$IFACE"]=1
 
     ((INPUT_COUNT+=1))
@@ -1266,6 +1673,28 @@ for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
         "${MAP_IPV6[$VLAN_IF]}"
 done
 
+echo
+printf "%-16s %-20s %-10s %-12s %-42s %-10s %-12s\n" \
+    "接口" "IPv4 网关" "IPv4 表" "IPv4 优先级" \
+    "IPv6 网关" "IPv6 表" "IPv6 优先级"
+printf "%-16s %-20s %-10s %-12s %-42s %-10s %-12s\n" \
+    "--------------" "------------------" "--------" "------------" \
+    "----------------------------------------" "--------" "------------"
+
+for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
+    VLAN_IF="${PARENT_IF}.${VLAN_ID}"
+    POLICY_INDEX=$((VLAN_ID - VLAN_START))
+
+    printf "%-16s %-20s %-10s %-12s %-42s %-10s %-12s\n" \
+        "$VLAN_IF" \
+        "${MAP_IPV4_GATEWAY[$VLAN_IF]}" \
+        "$((IPV4_TABLE_BASE + POLICY_INDEX))" \
+        "$IPV4_POLICY_PRIORITY" \
+        "${MAP_IPV6_GATEWAY[$VLAN_IF]}" \
+        "$((IPV6_TABLE_BASE + POLICY_INDEX))" \
+        "$IPV6_POLICY_PRIORITY"
+done
+
 
 # ============================================================
 # 最终确认
@@ -1286,12 +1715,86 @@ fi
 # ============================================================
 
 declare -a CREATED_INTERFACES=()
+declare -a CONFIGURED_POLICIES=()
 declare -A OLD_VLAN_PROTOCOL=()
 declare -A OLD_VLAN_MAC=()
 declare -A OLD_VLAN_MTU=()
 declare -A OLD_VLAN_ADMIN_UP=()
 declare -A OLD_VLAN_IPV4=()
 declare -A OLD_VLAN_IPV6=()
+
+
+# 功能：删除上一版持久化配置拥有的全部策略路由。
+# 参数：无；从 APPLY_PATH 中读取 BATCH_VLAN_CONFIG_V2 记录。
+# 返回值：成功或没有旧策略配置时返回 0，配置记录损坏时返回 1。
+remove_saved_policy_configuration()
+{
+    local marker old_parent old_vlan_id old_vlan_if old_mac
+    local old_ipv4 old_ipv6 old_ipv4_network old_ipv6_network
+    local old_ipv4_gateway old_ipv6_gateway old_ipv4_table old_ipv6_table
+    local old_ipv4_priority old_ipv6_priority old_extra
+
+    [[ -r "$APPLY_PATH" ]] || return 0
+
+    while IFS=$'\t' read -r \
+        marker old_parent old_vlan_id old_vlan_if old_mac \
+        old_ipv4 old_ipv6 old_ipv4_network old_ipv6_network \
+        old_ipv4_gateway old_ipv6_gateway old_ipv4_table old_ipv6_table \
+        old_ipv4_priority old_ipv6_priority old_extra; do
+        [[ "$marker" == "# BATCH_VLAN_CONFIG_V2" ]] || continue
+        [[ -n "$old_ipv4" && -n "$old_ipv6" &&
+           -n "$old_ipv4_table" && -n "$old_ipv6_table" &&
+           -n "$old_ipv4_priority" && -n "$old_ipv6_priority" &&
+           -z "$old_extra" ]] || return 1
+        remove_policy_routing \
+            "${old_ipv4%/*}" \
+            "${old_ipv6%/*}" \
+            "$old_ipv4_table" \
+            "$old_ipv6_table" \
+            "$old_ipv4_priority" \
+            "$old_ipv6_priority"
+    done < "$APPLY_PATH"
+}
+
+
+# 功能：按照上一版持久化配置恢复全部策略路由。
+# 参数：无；从 APPLY_PATH 中读取 BATCH_VLAN_CONFIG_V2 记录。
+# 返回值：全部恢复成功时返回 0，没有旧策略配置时也返回 0。
+restore_saved_policy_configuration()
+{
+    local marker old_parent old_vlan_id old_vlan_if old_mac
+    local old_ipv4 old_ipv6 old_ipv4_network old_ipv6_network
+    local old_ipv4_gateway old_ipv6_gateway old_ipv4_table old_ipv6_table
+    local old_ipv4_priority old_ipv6_priority old_extra
+
+    [[ -r "$APPLY_PATH" ]] || return 0
+
+    while IFS=$'\t' read -r \
+        marker old_parent old_vlan_id old_vlan_if old_mac \
+        old_ipv4 old_ipv6 old_ipv4_network old_ipv6_network \
+        old_ipv4_gateway old_ipv6_gateway old_ipv4_table old_ipv6_table \
+        old_ipv4_priority old_ipv6_priority old_extra; do
+        [[ "$marker" == "# BATCH_VLAN_CONFIG_V2" ]] || continue
+        [[ -n "$old_vlan_if" && -n "$old_ipv4" && -n "$old_ipv6" &&
+           -n "$old_ipv4_network" && -n "$old_ipv6_network" &&
+           -n "$old_ipv4_gateway" && -n "$old_ipv6_gateway" &&
+           -n "$old_ipv4_table" && -n "$old_ipv6_table" &&
+           -n "$old_ipv4_priority" && -n "$old_ipv6_priority" &&
+           -z "$old_extra" ]] || return 1
+        ensure_policy_routing \
+            "$old_vlan_if" \
+            "$old_ipv4" \
+            "$old_ipv6" \
+            "$old_ipv4_network" \
+            "$old_ipv6_network" \
+            "$old_ipv4_gateway" \
+            "$old_ipv6_gateway" \
+            "$old_ipv4_table" \
+            "$old_ipv6_table" \
+            "$old_ipv4_priority" \
+            "$old_ipv6_priority" || return 1
+    done < "$APPLY_PATH"
+}
 
 
 # 功能：保存待替换 VLAN 的链路属性和全局 IP 地址。
@@ -1334,17 +1837,33 @@ snapshot_replaced_vlans()
     done
 }
 
-# 功能：删除本次执行中新建的 VLAN，并恢复被替换的旧 VLAN。
-# 参数：无；读取 CREATED_INTERFACES、REPLACED_VLANS 及旧状态快照。
+# 功能：删除本次新增的策略路由和 VLAN，并恢复被替换的旧配置。
+# 参数：无；读取新增记录、REPLACED_VLANS、旧状态和持久化配置。
 # 返回值：始终返回 0；恢复不完整时输出错误信息。
 rollback()
 {
-    local vif item vlan_id address
+    local vif item vlan_id address policy_record
+    local ipv4_source ipv6_source ipv4_table ipv6_table
+    local ipv4_priority ipv6_priority
     local restore_failed=0
     local -a addresses=()
 
     echo
     echo "======================================================================"
+
+    for policy_record in "${CONFIGURED_POLICIES[@]:-}"; do
+        [[ -z "$policy_record" ]] && continue
+        IFS=$'\t' read -r \
+            ipv4_source ipv6_source ipv4_table ipv6_table \
+            ipv4_priority ipv6_priority <<< "$policy_record"
+        remove_policy_routing \
+            "$ipv4_source" \
+            "$ipv6_source" \
+            "$ipv4_table" \
+            "$ipv6_table" \
+            "$ipv4_priority" \
+            "$ipv6_priority"
+    done
     echo "执行失败，开始回滚本次已经创建的 VLAN"
     echo "======================================================================"
 
@@ -1399,6 +1918,10 @@ rollback()
         fi
     done
 
+    if ! restore_saved_policy_configuration; then
+        restore_failed=1
+    fi
+
     echo
     if (( restore_failed == 0 )); then
         echo "回滚完成。"
@@ -1422,6 +1945,7 @@ echo "======================================================================"
 echo
 
 snapshot_replaced_vlans
+remove_saved_policy_configuration
 
 for ITEM in "${REPLACED_VLANS[@]:-}"; do
     [[ -z "$ITEM" ]] && continue
@@ -1440,6 +1964,11 @@ for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
 
     IPV4_ADDR="${MAP_IPV4[$VLAN_IF]}"
     IPV6_ADDR="${MAP_IPV6[$VLAN_IF]}"
+    POLICY_INDEX=$((VLAN_ID - VLAN_START))
+    IPV4_TABLE=$((IPV4_TABLE_BASE + POLICY_INDEX))
+    IPV6_TABLE=$((IPV6_TABLE_BASE + POLICY_INDEX))
+    IPV4_PRIORITY=$IPV4_POLICY_PRIORITY
+    IPV6_PRIORITY=$IPV6_POLICY_PRIORITY
 
 
     echo "------------------------------------------------------------"
@@ -1447,7 +1976,9 @@ for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
     echo "Interface : ${VLAN_IF}"
     echo "MAC       : ${VLAN_MAC}"
     echo "IPv4      : ${IPV4_ADDR}"
+    echo "IPv4 GW   : ${MAP_IPV4_GATEWAY[$VLAN_IF]}"
     echo "IPv6      : ${IPV6_ADDR}"
+    echo "IPv6 GW   : ${MAP_IPV6_GATEWAY[$VLAN_IF]}"
 
 
     ip link add \
@@ -1479,6 +2010,19 @@ for ((VLAN_ID=VLAN_START; VLAN_ID<=VLAN_END; VLAN_ID++)); do
     ip -6 addr add \
         "$IPV6_ADDR" \
         dev "$VLAN_IF"
+
+    ensure_policy_routing \
+        "$VLAN_IF" \
+        "$IPV4_ADDR" \
+        "$IPV6_ADDR" \
+        "${MAP_IPV4_NETWORK[$VLAN_IF]}" \
+        "${MAP_IPV6_NETWORK[$VLAN_IF]}" \
+        "${MAP_IPV4_GATEWAY[$VLAN_IF]}" \
+        "${MAP_IPV6_GATEWAY[$VLAN_IF]}" \
+        "$IPV4_TABLE" \
+        "$IPV6_TABLE" \
+        "$IPV4_PRIORITY" \
+        "$IPV6_PRIORITY"
 
 
     echo "状态      : OK"

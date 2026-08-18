@@ -25,149 +25,8 @@ ROOT_QDISC_HANDLE="4915:"
 EXEMPT_CLASS_ID="4915:1"
 LIMIT_CLASS_ID="4915:2"
 LIMIT_QDISC_HANDLE="4916:"
-EXEMPT_PORTS=(80 443 8080 49155 49156)
-EXEMPT_IPV4_ADDRESSES=(
-    103.217.192.44
-    111.31.23.235
-    111.31.23.236
-    111.31.239.101
-    111.31.239.74
-    111.31.56.252
-    111.32.176.142
-    111.33.67.100
-    111.33.67.107
-    111.33.67.114
-    111.33.67.115
-    111.33.67.36
-    111.33.67.62
-    111.33.67.98
-    113.207.85.145
-    113.248.82.27
-    113.250.21.245
-    113.88.11.179
-    113.88.220.60
-    113.88.221.186
-    113.88.71.24
-    113.88.8.236
-    113.88.9.182
-    113.88.9.220
-    113.89.104.181
-    113.89.105.148
-    113.89.105.77
-    113.89.106.129
-    116.233.219.167
-    116.7.104.251
-    116.7.106.188
-    116.7.106.219
-    116.7.3.18
-    117.143.249.158
-    119.123.104.130
-    119.123.105.168
-    119.123.107.244
-    119.123.107.60
-    119.123.107.96
-    119.123.61.240
-    119.136.129.25
-    119.136.132.172
-    119.136.133.36
-    119.136.134.96
-    119.136.135.186
-    119.84.242.247
-    120.232.204.94
-    120.232.40.21
-    120.232.94.18
-    120.232.94.43
-    120.233.2.216
-    120.233.203.153
-    120.241.230.108
-    120.241.230.110
-    120.241.230.117
-    120.241.89.253
-    120.255.24.23
-    120.255.24.41
-    121.15.184.186
-    121.35.41.52
-    14.104.23.69
-    14.116.174.226
-    14.116.174.57
-    14.155.41.8
-    180.163.123.143
-    180.165.32.92
-    180.212.27.124
-    180.212.68.192
-    183.226.134.190
-    183.226.149.122
-    183.226.47.172
-    183.227.172.193
-    183.227.255.143
-    218.18.200.230
-    218.18.201.170
-    218.18.201.181
-    218.18.204.161
-    218.18.205.229
-    218.18.206.156
-    218.18.206.219
-    218.18.207.49
-    218.18.208.117
-    218.18.208.130
-    219.151.130.222
-    222.179.228.250
-    222.71.53.150
-    42.81.82.247
-    58.144.118.14
-    58.60.33.223
-    59.39.211.199
-    59.39.213.148
-    59.39.213.251
-    59.39.214.110
-    59.39.222.126
-    59.39.222.60
-    60.25.97.158
-    60.25.97.188
-    60.25.97.190
-    60.25.97.192
-    60.25.97.35
-    60.25.97.38
-    60.25.97.41
-    61.141.155.141
-    61.141.155.71
-    61.141.163.114
-    61.141.166.161
-    61.141.167.156
-    61.141.168.102
-    61.141.169.22
-    61.141.170.17
-    61.141.173.74
-    61.141.174.221
-    61.141.174.250
-    61.141.175.212
-    61.141.175.40
-    61.141.176.161
-    61.141.176.76
-    61.141.178.146
-    61.141.180.77
-    61.141.204.148
-    61.141.204.28
-    61.141.204.47
-    61.141.204.6
-    61.141.204.8
-    61.141.205.53
-    61.141.205.66
-    61.141.206.133
-    61.170.153.109
-    61.170.153.195
-    61.170.160.25
-    61.170.183.168
-    61.170.216.175
-    61.170.216.213
-    61.170.217.174
-    61.170.218.74
-    61.170.224.120
-    61.170.224.187
-    61.170.225.137
-    61.170.48.129
-    61.170.48.131
-)
+EXEMPT_PORTS=(80 443 8080 49155 49156 49159)
+EXEMPT_IPV4_ADDRESSES=()
 CRON_MARKER="# network-rate-limit-managed"
 CRON_LOG_FILE="/var/log/device_upload_limit.log"
 SCRIPT_URL="https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh"
@@ -494,6 +353,7 @@ is_interface_limit_current() {
     local filter_info
     local ip_address
     local protocol
+    local transport_protocol
     local port
     local filter_priority=10
 
@@ -523,7 +383,7 @@ is_interface_limit_current() {
         return 1
     fi
 
-    for ip_address in "${EXEMPT_IPV4_ADDRESSES[@]}"; do
+    for ip_address in "${EXEMPT_IPV4_ADDRESSES[@]+"${EXEMPT_IPV4_ADDRESSES[@]}"}"; do
         if ! filter_info=$(tc filter show dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
             protocol ip priority "$filter_priority") \
             || ! grep -Eq "dst_ip $ip_address(/32)?([[:space:]]|$)" <<< "$filter_info" \
@@ -534,14 +394,17 @@ is_interface_limit_current() {
     done
 
     for protocol in ip ipv6; do
-        for port in "${EXEMPT_PORTS[@]}"; do
-            if ! filter_info=$(tc filter show dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
-                protocol "$protocol" priority "$filter_priority") \
-                || ! grep -Eq "src_port $port([[:space:]]|$)" <<< "$filter_info" \
-                || ! grep -Eq "classid $EXEMPT_CLASS_ID([[:space:]]|$)" <<< "$filter_info"; then
-                return 1
-            fi
-            filter_priority=$((filter_priority + 1))
+        for transport_protocol in tcp udp; do
+            for port in "${EXEMPT_PORTS[@]}"; do
+                if ! filter_info=$(tc filter show dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
+                    protocol "$protocol" priority "$filter_priority") \
+                    || ! grep -Eq "ip_proto $transport_protocol([[:space:]]|$)" <<< "$filter_info" \
+                    || ! grep -Eq "src_port $port([[:space:]]|$)" <<< "$filter_info" \
+                    || ! grep -Eq "classid $EXEMPT_CLASS_ID([[:space:]]|$)" <<< "$filter_info"; then
+                    return 1
+                fi
+                filter_priority=$((filter_priority + 1))
+            done
         done
     done
 }
@@ -582,8 +445,10 @@ apply_interface_limit() {
     local interface_name="$1"
     local ip_address
     local protocol
+    local transport_protocol
     local port
     local filter_priority=10
+    local exempt_ipv4_address_count=0
 
     if ! ip link show "$interface_name" >/dev/null 2>&1; then
         echo "Error: network interface not found: $interface_name" >&2
@@ -616,7 +481,7 @@ apply_interface_limit() {
     fi
 
     # 上传流量的远端地址是 destination IP，命中后直接进入不限速 band。
-    for ip_address in "${EXEMPT_IPV4_ADDRESSES[@]}"; do
+    for ip_address in "${EXEMPT_IPV4_ADDRESSES[@]+"${EXEMPT_IPV4_ADDRESSES[@]}"}"; do
         if ! tc filter replace dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
             protocol ip priority "$filter_priority" flower \
             dst_ip "$ip_address/32" classid "$EXEMPT_CLASS_ID"; then
@@ -624,22 +489,25 @@ apply_interface_limit() {
             return 1
         fi
         filter_priority=$((filter_priority + 1))
+        exempt_ipv4_address_count=$((exempt_ipv4_address_count + 1))
     done
 
-    # HTTP 响应从服务端口发出，因此出口流量按 TCP source port 匹配。
+    # 服务响应从服务端口发出，因此出口流量按 TCP/UDP source port 匹配。
     for protocol in ip ipv6; do
-        for port in "${EXEMPT_PORTS[@]}"; do
-            if ! tc filter replace dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
-                protocol "$protocol" priority "$filter_priority" flower \
-                ip_proto tcp src_port "$port" classid "$EXEMPT_CLASS_ID"; then
-                echo "Error: failed to exempt TCP source port $port ($protocol) on $interface_name" >&2
-                return 1
-            fi
-            filter_priority=$((filter_priority + 1))
+        for transport_protocol in tcp udp; do
+            for port in "${EXEMPT_PORTS[@]}"; do
+                if ! tc filter replace dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
+                    protocol "$protocol" priority "$filter_priority" flower \
+                    ip_proto "$transport_protocol" src_port "$port" classid "$EXEMPT_CLASS_ID"; then
+                    echo "Error: failed to exempt $transport_protocol source port $port ($protocol) on $interface_name" >&2
+                    return 1
+                fi
+                filter_priority=$((filter_priority + 1))
+            done
         done
     done
 
-    echo "$(date '+%F %T') $interface_name limit refreshed: $RATE; ${#EXEMPT_IPV4_ADDRESSES[@]} destination IPv4 addresses and TCP source ports ${EXEMPT_PORTS[*]} exempted"
+    echo "$(date '+%F %T') $interface_name limit refreshed: $RATE; $exempt_ipv4_address_count destination IPv4 addresses and TCP/UDP source ports ${EXEMPT_PORTS[*]} exempted"
 }
 
 # 功能：为所有目标接口应用 TBF 出口限速。

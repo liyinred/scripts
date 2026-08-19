@@ -25,7 +25,8 @@ ROOT_QDISC_HANDLE="4915:"
 EXEMPT_CLASS_ID="4915:1"
 LIMIT_CLASS_ID="4915:2"
 LIMIT_QDISC_HANDLE="4916:"
-EXEMPT_PORTS=(80 443 8080 49155 49156 49159)
+EXEMPT_SOURCE_PORTS=(22 80 443 8080 49155 49156)
+EXEMPT_DESTINATION_PORTS=(80 443 8001 8080)
 EXEMPT_IPV4_ADDRESSES=()
 CRON_MARKER="# network-rate-limit-managed"
 CRON_LOG_FILE="/var/log/device_upload_limit.log"
@@ -345,8 +346,8 @@ remove_interface_limit() {
 }
 
 # 功能：检查指定接口上的出口限速规则是否与当前配置完全一致。
-# 参数：$1 为网络接口名称；限速值、豁免 IP 和豁免端口从全局变量读取。
-# 返回值：根队列、TBF 速率以及全部 IP 和端口豁免规则一致时返回 0，否则返回 1。
+# 参数：$1 为网络接口名称；限速值、豁免 IP、source port 和 destination port 从全局变量读取。
+# 返回值：根队列、TBF 速率以及全部 IP、source port 和 destination port 豁免规则一致时返回 0，否则返回 1。
 is_interface_limit_current() {
     local interface_name="$1"
     local qdisc_info
@@ -395,11 +396,26 @@ is_interface_limit_current() {
 
     for protocol in ip ipv6; do
         for transport_protocol in tcp udp; do
-            for port in "${EXEMPT_PORTS[@]}"; do
+            for port in "${EXEMPT_SOURCE_PORTS[@]}"; do
                 if ! filter_info=$(tc filter show dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
                     protocol "$protocol" priority "$filter_priority") \
                     || ! grep -Eq "ip_proto $transport_protocol([[:space:]]|$)" <<< "$filter_info" \
                     || ! grep -Eq "src_port $port([[:space:]]|$)" <<< "$filter_info" \
+                    || ! grep -Eq "classid $EXEMPT_CLASS_ID([[:space:]]|$)" <<< "$filter_info"; then
+                    return 1
+                fi
+                filter_priority=$((filter_priority + 1))
+            done
+        done
+    done
+
+    for protocol in ip ipv6; do
+        for transport_protocol in tcp udp; do
+            for port in "${EXEMPT_DESTINATION_PORTS[@]}"; do
+                if ! filter_info=$(tc filter show dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
+                    protocol "$protocol" priority "$filter_priority") \
+                    || ! grep -Eq "ip_proto $transport_protocol([[:space:]]|$)" <<< "$filter_info" \
+                    || ! grep -Eq "dst_port $port([[:space:]]|$)" <<< "$filter_info" \
                     || ! grep -Eq "classid $EXEMPT_CLASS_ID([[:space:]]|$)" <<< "$filter_info"; then
                     return 1
                 fi
@@ -438,8 +454,8 @@ limit_off() {
     return "$failed"
 }
 
-# 功能：在指定接口上按目标 IP 和源端口分类出口流量，命中豁免规则时不限速。
-# 参数：$1 为网络接口名称；限速值、豁免 IP 和豁免端口从全局变量读取。
+# 功能：在指定接口上按目标 IP、source port 和 destination port 分类出口流量，命中豁免规则时不限速。
+# 参数：$1 为网络接口名称；限速值、豁免 IP、source port 和 destination port 从全局变量读取。
 # 返回值：应用限速成功时返回 0，否则返回 1。
 apply_interface_limit() {
     local interface_name="$1"
@@ -495,7 +511,7 @@ apply_interface_limit() {
     # 服务响应从服务端口发出，因此出口流量按 TCP/UDP source port 匹配。
     for protocol in ip ipv6; do
         for transport_protocol in tcp udp; do
-            for port in "${EXEMPT_PORTS[@]}"; do
+            for port in "${EXEMPT_SOURCE_PORTS[@]}"; do
                 if ! tc filter replace dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
                     protocol "$protocol" priority "$filter_priority" flower \
                     ip_proto "$transport_protocol" src_port "$port" classid "$EXEMPT_CLASS_ID"; then
@@ -507,7 +523,22 @@ apply_interface_limit() {
         done
     done
 
-    echo "$(date '+%F %T') $interface_name limit refreshed: $RATE; $exempt_ipv4_address_count destination IPv4 addresses and TCP/UDP source ports ${EXEMPT_PORTS[*]} exempted"
+    # 本机作为客户端访问远程服务时，出口流量按 TCP/UDP destination port 匹配。
+    for protocol in ip ipv6; do
+        for transport_protocol in tcp udp; do
+            for port in "${EXEMPT_DESTINATION_PORTS[@]}"; do
+                if ! tc filter replace dev "$interface_name" parent "$ROOT_QDISC_HANDLE" \
+                    protocol "$protocol" priority "$filter_priority" flower \
+                    ip_proto "$transport_protocol" dst_port "$port" classid "$EXEMPT_CLASS_ID"; then
+                    echo "Error: failed to exempt $transport_protocol destination port $port ($protocol) on $interface_name" >&2
+                    return 1
+                fi
+                filter_priority=$((filter_priority + 1))
+            done
+        done
+    done
+
+    echo "$(date '+%F %T') $interface_name limit refreshed: $RATE; $exempt_ipv4_address_count destination IPv4 addresses, TCP/UDP source ports ${EXEMPT_SOURCE_PORTS[*]}, and TCP/UDP destination ports ${EXEMPT_DESTINATION_PORTS[*]} exempted"
 }
 
 # 功能：为所有目标接口应用 TBF 出口限速。

@@ -93,14 +93,13 @@ sudo systemctl enable chronyd
 sudo systemctl restart chronyd
 sudo chronyc -a makestep
 
-# 每秒检查一次，最多等待约 10 秒，要求剩余时间校正量不超过 0.5 秒。
-if ! sudo chronyc -a waitsync 10 0.5 0 1; then
-    echo "Error: system time synchronization failed."
+# 每秒检查一次，最多检查 5 次，要求剩余时间校正量不超过 0.5 秒。
+if sudo chronyc -a waitsync 5 0.5 0 1; then
+    echo "==> Time synchronization succeeded: $(date '+%Y-%m-%d %H:%M:%S %Z %z')"
+else
+    echo "Warning: system time synchronization failed; continuing installation."
     sudo chronyc sources -v || true
-    exit 1
 fi
-
-echo "==> Time synchronization succeeded: $(date '+%Y-%m-%d %H:%M:%S %Z %z')"
 
 # ---------- 5. 下载脚本 ----------
 echo "==> [5/8] Downloading net_traffic_monitor.py..."

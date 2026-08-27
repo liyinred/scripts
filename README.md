@@ -200,3 +200,9 @@ pnpm run docs:build         # 构建到 ../dist_docs
    - 编辑 `scripts/vitepress_project/docs/*.md`
    - `cd scripts/vitepress_project && pnpm run docs:build`
    - 部署 `dist_docs/` 或上传 `dist_docs.zip`。
+5. **追加提交并同步多个远程仓库**
+   - 将暂存区改动并入最近一次提交（保持提交信息不变），随后分别推送到 `origin` 的 `master` 分支与 `github` 的 `main` 分支：
+
+   ```powershell
+   git add . && git commit --amend --no-edit && git push --force-with-lease origin main:master && git push --force-with-lease github main:main
+   ```

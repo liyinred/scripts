@@ -8,6 +8,7 @@
 功能：
 1. 每整五分钟统计各网卡窗口平均上下行速率。
 2. 将统计结果写入本地 SQLite 数据库。
+3. 上报小合云系统流量接口（可选）。
 """
 
 import sqlite3
@@ -51,7 +52,7 @@ DB_PATH = 'net_traffic.db'          # SQLite 文件名模板，按北京时间�
 DB_DIR = 'net_traffic_data'         # 月度 SQLite 文件保存目录
 API_LOG_DIR = 'api_log'             # API 请求响应日志目录
 INTERVAL = 300                      # 统计周期：300 秒（整五分钟）
-MIN_STARTUP_WINDOW_REMAINING_SECONDS = 1.0  # 首次窗口允许采集的最短剩余时间
+MIN_STARTUP_WINDOW_REMAINING_SECONDS = 5.0  # 首次窗口允许采集的最短剩余时间
 NET_DEV_PATH = '/proc/net/dev'      # Linux 网络统计文件
 NET_VLAN_CONFIG_PATH = '/proc/net/vlan/config'  # Linux VLAN 与父接口映射文件
 SIOCGIFHWADDR = 0x8927              # ioctl 获取 MAC 地址的请求码
@@ -86,6 +87,7 @@ EXPECTED_COLUMNS = [
 ]
 
 MAX_NET_COUNTER_VALUE = (1 << 64) - 1  # Linux 网络累计计数器的 unsigned 64-bit 上限
+MAX_TRAFFIC_SPEED_BPS = 10000 * 1000 * 1000 * 1000  # 入库和上报速率上限：10000 Gbps
 
 INITIALIZED_DB_PATHS = set()
 
@@ -1541,21 +1543,6 @@ def get_collectible_mac(iface):
     return mac
 
 
-def calc_counter_delta(prev_value, cur_value):
-    """计算网卡计数器增量，计数器下降时返回 None。
-
-    参数:
-        prev_value: 窗口起点的累计计数器值。
-        cur_value: 窗口终点的累计计数器值。
-
-    返回:
-        int 或 None: 正常时返回非负增量；计数器下降时返回 None。
-    """
-    if cur_value < prev_value:
-        return None
-    return cur_value - prev_value
-
-
 def find_counter_window_anomaly(prev_counters, cur_counters):
     """检查窗口前后两次网络计数器采样是否存在异常。
 
@@ -1637,34 +1624,23 @@ def build_adjusted_counter_deltas(
     cur_counters,
     vlan_children_by_parent
 ):
-    """计算接口计数器增量，并从父接口扣除直属 VLAN 子接口增量。
+    """根据已校验的计数器计算增量，并直接扣除 VLAN 子接口增量。
 
     参数:
-        prev_counters: 窗口起点采集到的网卡累计计数器。
-        cur_counters: 窗口终点采集到的网卡累计计数器。
+        prev_counters: 经窗口异常检查的起点网卡累计计数器。
+        cur_counters: 经窗口异常检查的终点网卡累计计数器。
         vlan_children_by_parent: 父接口与直属 VLAN 子接口名称列表的映射。
 
     返回:
-        dict 或 None: 正常时返回接口增量；计数器下降时返回 None。
+        dict: 按接口返回修正后的收发计数器增量。
     """
-    all_ifaces = set(prev_counters.keys()) | set(cur_counters.keys())
     raw_deltas = {}
-    for iface in all_ifaces:
-        prev_values = prev_counters.get(iface, {})
-        cur_values = cur_counters.get(iface, {})
-        rx_delta = calc_counter_delta(
-            prev_values.get('rx_bytes', 0),
-            cur_values.get('rx_bytes', 0)
-        )
-        tx_delta = calc_counter_delta(
-            prev_values.get('tx_bytes', 0),
-            cur_values.get('tx_bytes', 0)
-        )
-        if rx_delta is None or tx_delta is None:
-            return None
+    for iface in prev_counters:
+        prev_values = prev_counters[iface]
+        cur_values = cur_counters[iface]
         raw_deltas[iface] = {
-            'rx_delta': rx_delta,
-            'tx_delta': tx_delta
+            'rx_delta': cur_values['rx_bytes'] - prev_values['rx_bytes'],
+            'tx_delta': cur_values['tx_bytes'] - prev_values['tx_bytes']
         }
 
     adjusted_deltas = dict(
@@ -1687,20 +1663,9 @@ def build_adjusted_counter_deltas(
         parent_rx_delta = raw_deltas[parent_iface]['rx_delta']
         parent_tx_delta = raw_deltas[parent_iface]['tx_delta']
 
-        if child_rx_delta > parent_rx_delta or child_tx_delta > parent_tx_delta:
-            logger.warning(
-                "父接口 %s 的 VLAN 子接口增量超过父接口原始增量，修正结果将截断为 0："
-                "parent_rx=%d child_rx=%d parent_tx=%d child_tx=%d",
-                parent_iface,
-                parent_rx_delta,
-                child_rx_delta,
-                parent_tx_delta,
-                child_tx_delta
-            )
-
         adjusted_deltas[parent_iface] = {
-            'rx_delta': max(parent_rx_delta - child_rx_delta, 0),
-            'tx_delta': max(parent_tx_delta - child_tx_delta, 0)
+            'rx_delta': parent_rx_delta - child_rx_delta,
+            'tx_delta': parent_tx_delta - child_tx_delta
         }
 
     return adjusted_deltas
@@ -1713,10 +1678,11 @@ def build_record(window_start, iface, counter_deltas, elapsed):
         window_start: 当前统计窗口开始 Unix 时间戳。
         iface: 当前网卡名称。
         counter_deltas: 当前网卡修正后的 rx_delta 和 tx_delta。
-        elapsed: 两次采样之间的实际耗时，单位为秒。
+        elapsed: 已校验为正数的两次采样实际耗时，单位为秒。
 
     返回:
-        tuple 或 None: 成功时返回待入库五元组，无法取得有效 MAC 时返回 None。
+        tuple 或 None: 成功时返回待入库五元组；任一速率超过上限或
+        无法取得有效 MAC 时返回 None。
     """
     mac = get_collectible_mac(iface)
     if mac is None:
@@ -1726,11 +1692,21 @@ def build_record(window_start, iface, counter_deltas, elapsed):
     rx_delta = counter_deltas.get('rx_delta', 0)
     tx_delta = counter_deltas.get('tx_delta', 0)
 
-    if elapsed <= 0:
-        elapsed = float(INTERVAL)
-
     rx_speed = (float(rx_delta) * 8.0) / elapsed
     tx_speed = (float(tx_delta) * 8.0) / elapsed
+    if (
+        rx_speed > MAX_TRAFFIC_SPEED_BPS
+        or tx_speed > MAX_TRAFFIC_SPEED_BPS
+    ):
+        logger.warning(
+            "跳过网卡 %s 异常流量记录，不入库且不上报："
+            "rx_speed=%.2f bps，tx_speed=%.2f bps，上限=10000 Gbps。",
+            iface,
+            rx_speed,
+            tx_speed
+        )
+        return None
+
     rx_speed_rounded = round_half_up(rx_speed)
     tx_speed_rounded = round_half_up(tx_speed)
     return (
@@ -1788,7 +1764,7 @@ def should_skip_startup_window(startup_sample_time, window_end):
         window_end: 当前窗口结束的 Unix 时间戳。
 
     返回:
-        bool: 剩余时间小于 1 秒时返回 True，否则返回 False。
+        bool: 剩余时间小于 5 秒时返回 True，否则返回 False。
     """
     remaining_seconds = window_end - startup_sample_time
     return remaining_seconds < MIN_STARTUP_WINDOW_REMAINING_SECONDS
@@ -1848,7 +1824,13 @@ def process_window_records(
         list: 已生成并处理的数据库记录列表。
     """
     if elapsed <= 0:
-        elapsed = float(INTERVAL)
+        logger.warning(
+            "跳过异常流量窗口，time_id=%d，不入库且不上报："
+            "采样耗时 elapsed=%.6f 秒。",
+            window_start,
+            elapsed
+        )
+        return []
 
     anomaly_reason = find_counter_window_anomaly(prev_counters, cur_counters)
     if anomaly_reason is not None:
@@ -1865,12 +1847,6 @@ def process_window_records(
         cur_counters,
         vlan_children_by_parent
     )
-    if adjusted_counter_deltas is None:
-        logger.warning(
-            "跳过异常流量窗口，time_id=%d，不入库且不上报：计数器增量为负数",
-            window_start
-        )
-        return []
     records = []
     for iface in resolve_window_ifaces(
         prev_counters,
@@ -1902,6 +1878,13 @@ def process_window_records(
     )
 
     if traffic_api_post:
+        if not records:
+            logger.info(
+                "当前窗口无有效流量记录，跳过流量 API 上报，time_id=%d。",
+                window_start
+            )
+            return records
+
         upload_delay_seconds, upload_bucket_index, upload_bucket_count = (
             calculate_random_upload_delay()
         )

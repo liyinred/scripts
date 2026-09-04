@@ -25,16 +25,13 @@ ROOT_QDISC_HANDLE="4915:"
 EXEMPT_CLASS_ID="4915:1"
 LIMIT_CLASS_ID="4915:2"
 LIMIT_QDISC_HANDLE="4916:"
-EXEMPT_SOURCE_PORTS=(22 80 443)
-EXEMPT_DESTINATION_PORTS=(80 443 8001)
+EXEMPT_SOURCE_PORTS=(22 80 443 8080 49155 49156)
+EXEMPT_DESTINATION_PORTS=(80 443 8001 8080)
 EXEMPT_IPV4_ADDRESSES=()
 CRON_MARKER="# network-rate-limit-managed"
 CRON_LOG_FILE="/var/log/device_upload_limit.log"
 SCRIPT_URL="https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh"
 PERSISTENT_SCRIPT_PATH="/usr/local/sbin/device_upload_limit.sh"
-CYCLE_STATE_FILE="/run/device_upload_limit_cycle_start"
-CYCLE_TOTAL_MINUTES=11
-CYCLE_LIMITED_MINUTES=10
 
 # 功能：检查脚本运行所需权限和命令。
 # 参数：无。
@@ -47,7 +44,7 @@ check_requirements() {
         return 1
     fi
 
-    for command_name in ip tc awk grep date rm; do
+    for command_name in ip tc awk grep date; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             echo "Error: required command not found: $command_name" >&2
             return 1
@@ -586,70 +583,11 @@ is_limited_hour() {
     fi
 }
 
-# 功能：清除当前限速时段的周期起点，使下次进入时重新开始 11 分钟周期。
-# 参数：使用全局变量 CYCLE_STATE_FILE。
-# 返回值：状态文件删除成功或不存在时返回 0，否则返回 1。
-clear_cycle_state() {
-    if ! rm -f "$CYCLE_STATE_FILE"; then
-        echo "Error: failed to clear cycle state: $CYCLE_STATE_FILE" >&2
-        return 1
-    fi
-}
-
-# 功能：判断当前分钟是否属于 11 分钟周期内前 10 分钟的整体限速阶段，并在首次运行时记录周期起点。
-# 参数：$1 为当前 epoch 分钟；周期配置和状态文件路径从全局变量读取。
-# 返回值：应开启整体限速时返回 0，后 1 分钟应关闭整体限速时返回 1，状态读写失败时返回 2。
-is_cycle_limit_enabled() {
-    local current_epoch_minute="$1"
-    local state_start
-    local state_end
-    local cycle_start_minute
-    local elapsed_minutes
-    local window_duration_minutes
-    local reset_cycle=false
-
-    if [ -f "$CYCLE_STATE_FILE" ]; then
-        if ! read -r state_start state_end cycle_start_minute < "$CYCLE_STATE_FILE"; then
-            echo "Error: failed to read cycle state: $CYCLE_STATE_FILE" >&2
-            return 2
-        fi
-    fi
-
-    if [ "$START" -lt "$END" ]; then
-        window_duration_minutes=$(((END - START) * 60))
-    else
-        window_duration_minutes=$(((24 - START + END) * 60))
-    fi
-
-    if [ "${state_start:-}" != "$START" ] || [ "${state_end:-}" != "$END" ] \
-        || ! [[ "${cycle_start_minute:-}" =~ ^[0-9]+$ ]]; then
-        reset_cycle=true
-    else
-        elapsed_minutes=$((current_epoch_minute - cycle_start_minute))
-        if [ "$elapsed_minutes" -lt 0 ] || [ "$elapsed_minutes" -ge "$window_duration_minutes" ]; then
-            reset_cycle=true
-        fi
-    fi
-
-    if [ "$reset_cycle" = true ]; then
-        cycle_start_minute="$current_epoch_minute"
-        if ! printf '%s %s %s\n' "$START" "$END" "$cycle_start_minute" > "$CYCLE_STATE_FILE"; then
-            echo "Error: failed to write cycle state: $CYCLE_STATE_FILE" >&2
-            return 2
-        fi
-        elapsed_minutes=0
-    fi
-
-    [ $((elapsed_minutes % CYCLE_TOTAL_MINUTES)) -lt "$CYCLE_LIMITED_MINUTES" ]
-}
-
 # 功能：管理 cron 任务，或根据当前时间开启或解除出口限速。
 # 参数：接收脚本的全部命令行参数。
 # 返回值：操作成功时返回 0，参数、环境、cron 或 tc 操作失败时返回非 0。
 main() {
     local current_hour
-    local current_epoch_minute
-    local cycle_status
 
     if [ "${1:-}" = "off" ]; then
         if [ "$#" -ne 1 ]; then
@@ -657,7 +595,7 @@ main() {
             return 1
         fi
         check_requirements || return 1
-        clear_cycle_state && limit_off
+        limit_off
         return
     fi
 
@@ -669,7 +607,7 @@ main() {
         check_cron_requirements || return 1
         check_requirements || return 1
         remove_cron_task || return 1
-        clear_cycle_state && limit_off
+        limit_off
         return
     fi
 
@@ -689,22 +627,9 @@ main() {
 
     current_hour=$((10#$(date +%H)))
     if is_limited_hour "$current_hour"; then
-        current_epoch_minute=$(($(date +%s) / 60))
-        is_cycle_limit_enabled "$current_epoch_minute"
-        cycle_status=$?
-        case "$cycle_status" in
-            0)
-                limit_on
-                ;;
-            1)
-                limit_off
-                ;;
-            *)
-                return "$cycle_status"
-                ;;
-        esac
+        limit_on
     else
-        clear_cycle_state && limit_off
+        limit_off
     fi
 }
 

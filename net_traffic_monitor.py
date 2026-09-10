@@ -32,9 +32,8 @@ except ImportError:
     fcntl = None
 
 try:
-    import urllib2
+    import urllib2 as urllib_request
 except ImportError:
-    urllib2 = None
     import urllib.request as urllib_request
 
 
@@ -92,13 +91,20 @@ MAX_TRAFFIC_SPEED_BPS = 10000 * 1000 * 1000 * 1000  # 入库和上报速率上�
 INITIALIZED_DB_PATHS = set()
 
 
-def beijing_log_time_converter(timestamp):
-    """将日志时间戳转换为北京时间元组。"""
+def get_beijing_time_tuple(timestamp):
+    """将 Unix 时间戳转换为北京时间元组。
+
+    参数:
+        timestamp: Unix 时间戳。
+
+    返回:
+        time.struct_time: 对应的北京时间元组。
+    """
     return time.gmtime(timestamp + BEIJING_UTC_OFFSET)
 
 
 # Python 2.7 中普通函数作为类属性会被绑定为实例方法，需显式声明为静态方法。
-logging.Formatter.converter = staticmethod(beijing_log_time_converter)
+logging.Formatter.converter = staticmethod(get_beijing_time_tuple)
 
 
 # ── 启动参数 ────────────────────────────────────────────────────────────────
@@ -182,11 +188,6 @@ def validate_upload_api_args(traffic_upload_url, ip_address):
 
 
 # ── 北京时间与月度数据库路径 ────────────────────────────────────────────────
-
-def get_beijing_time_tuple(timestamp):
-    """将 Unix 时间戳转换为北京时间的 time.struct_time。"""
-    return time.gmtime(timestamp + BEIJING_UTC_OFFSET)
-
 
 def format_beijing_time(timestamp):
     """格式化 Unix 时间戳对应的北京时间。"""
@@ -281,47 +282,27 @@ def filter_upload_records(records):
     ]
 
 
-def build_traffic_payload(records):
-    """将数据库记录转换为流量上报 JSON 数组对应的 Python 数据结构。
+def build_traffic_payload(records, is_compute_server_upload=False, ip_address=None):
+    """将数据库记录转换为指定上报模式的 JSON 数组。
 
     参数:
-        records: 已过滤的待上报记录列表，每项包含 time_id、iface、mac、rx_speed、tx_speed。
+        records: 已过滤的记录列表，每项为 time_id、iface、mac、rx_speed、tx_speed。
+        is_compute_server_upload: True 使用 ip 字段，否则使用 mac 字段。
+        ip_address: 算力服务器上报使用的当前主机 IP。
 
     返回:
         list: 可序列化为 JSON 数组的流量上报数据。
     """
-    payload = []
-
-    for record in records:
-        payload.append({
+    identity_key = 'ip' if is_compute_server_upload else 'mac'
+    return [
+        {
             'time_id': LONG_TYPE(record[0]),
-            'mac': record[2],
+            identity_key: ip_address if is_compute_server_upload else record[2],
             'rx_speed': LONG_TYPE(record[3]),
             'tx_speed': LONG_TYPE(record[4])
-        })
-
-    return payload
-
-
-def build_compute_server_traffic_payload(records, ip_address):
-    """将 eth0 数据库记录转换为算力服务器流量上报 JSON 数组。
-
-    参数:
-        records: 待上报记录列表，每项包含 time_id、iface、mac、rx_speed、tx_speed。
-        ip_address: 当前主机 IP，将写入上报数据的 ip 字段。
-
-    返回:
-        list: 可序列化为 JSON 数组的算力服务器流量上报数据。
-    """
-    payload = []
-    for record in records:
-        payload.append({
-            'time_id': LONG_TYPE(record[0]),
-            'ip': ip_address,
-            'rx_speed': LONG_TYPE(record[3]),
-            'tx_speed': LONG_TYPE(record[4])
-        })
-    return payload
+        }
+        for record in records
+    ]
 
 
 def decode_response_body(response_body):
@@ -460,106 +441,47 @@ def parse_api_log_window_start(header_line):
     return parse_beijing_time_text(window_time)
 
 
-def list_api_log_paths():
-    """列出当前目录下全部月度 API 普通日志文件。
+def list_api_log_paths(error_logs=False):
+    """列出指定类型的月度 API 日志文件。
 
     参数:
-        无。
+        error_logs: 为 True 时列出异常日志，否则列出普通日志。
 
     返回:
-        list: API 普通日志文件路径列表，按文件名升序排列。
+        list: 按文件名升序排列的日志文件路径列表。
     """
     if not os.path.isdir(API_LOG_DIR):
         return []
 
-    log_paths = []
-    for file_name in sorted(os.listdir(API_LOG_DIR)):
-        if not file_name.startswith('traffic_api_'):
-            continue
-        if not file_name.endswith(API_LOG_SUFFIX):
-            continue
-        if file_name.endswith(API_ERROR_LOG_SUFFIX):
-            continue
-        log_paths.append(os.path.join(API_LOG_DIR, file_name))
-
-    return log_paths
+    return [
+        os.path.join(API_LOG_DIR, file_name)
+        for file_name in sorted(os.listdir(API_LOG_DIR))
+        if file_name.startswith('traffic_api_')
+        and file_name.endswith(API_LOG_SUFFIX)
+        and file_name.endswith(API_ERROR_LOG_SUFFIX) == error_logs
+    ]
 
 
-def list_api_error_log_paths():
-    """列出当前目录下全部月度 API 异常日志文件。
+def split_api_log_entries(log_text, error_logs=False):
+    """按指定类型的日志头部切分 API 日志记录。
 
     参数:
-        无。
+        log_text: API 日志完整文本。
+        error_logs: 为 True 时匹配异常日志头部，否则匹配普通日志头部。
 
     返回:
-        list: API 异常日志文件路径列表，按文件名升序排列。
+        list: 单条日志文本列表，保留无法识别的内容供后续处理。
     """
-    if not os.path.isdir(API_LOG_DIR):
-        return []
-
-    log_paths = []
-    for file_name in sorted(os.listdir(API_LOG_DIR)):
-        if not file_name.startswith('traffic_api_'):
-            continue
-        if not file_name.endswith(API_ERROR_LOG_SUFFIX):
-            continue
-        log_paths.append(os.path.join(API_LOG_DIR, file_name))
-
-    return log_paths
-
-
-def split_api_error_log_entries(log_text):
-    """按异常日志头部切分单条失败上报记录。
-
-    参数:
-        log_text: API 异常日志完整文本。
-
-    返回:
-        list: 单条异常日志文本列表。
-    """
+    header_markers = (' window_time=', ' time_id=', ' error=') if error_logs else (
+        ' window_time=', ' status='
+    )
     entries = []
     current_lines = []
 
     for line in log_text.splitlines():
         is_entry_header = (
             line.startswith('[')
-            and ' window_time=' in line
-            and ' time_id=' in line
-            and ' error=' in line
-        )
-        if is_entry_header and current_lines:
-            entry_text = '\n'.join(current_lines).strip()
-            if entry_text:
-                entries.append(entry_text)
-            current_lines = [line]
-            continue
-
-        current_lines.append(line)
-
-    entry_text = '\n'.join(current_lines).strip()
-    if entry_text:
-        entries.append(entry_text)
-
-    return entries
-
-
-def split_api_log_entries(log_text):
-    """按普通 API 日志头部切分单条请求响应记录。
-
-    参数:
-        log_text: API 普通日志完整文本。
-
-    返回:
-        list: 单条 API 普通日志文本列表。
-    """
-    entries = []
-    current_lines = []
-
-    for line in log_text.splitlines():
-        is_entry_header = (
-            line.startswith('[')
-            and ' window_time=' in line
-            and ' status=' in line
+            and all(marker in line for marker in header_markers)
         )
         if is_entry_header and current_lines:
             entry_text = '\n'.join(current_lines).strip()
@@ -615,17 +537,7 @@ def parse_api_error_log_timestamp(header_line):
     返回:
         int: 异常日志记录对应的 time_id。
     """
-    marker = ' time_id='
-    start_index = header_line.find(marker)
-    if start_index < 0:
-        raise ValueError("异常日志头部缺少 time_id。")
-
-    start_index += len(marker)
-    end_index = header_line.find(' error=', start_index)
-    if end_index < 0:
-        end_index = len(header_line)
-
-    return LONG_TYPE(header_line[start_index:end_index])
+    return LONG_TYPE(parse_log_header_field(header_line, ' time_id=', [' error=']))
 
 
 def parse_api_error_log_records(entry_lines):
@@ -674,29 +586,12 @@ def parse_api_error_log_entry(entry_text):
     return timestamp, records
 
 
-def rewrite_api_error_log(log_path, entries):
-    """用保留的失败记录重写 API 异常日志文件。
-
-    参数:
-        log_path: API 异常日志文件路径。
-        entries: 仍需保留的异常日志记录文本列表。
-
-    返回:
-        None: 写入完成后不返回业务数据。
-    """
-    content = '\n\n'.join(entries)
-    if content:
-        content += '\n\n'
-    with open(log_path, 'w') as file_obj:
-        file_obj.write(content)
-
-
 def rewrite_api_log_entries(log_path, entries, extra_text=''):
-    """用保留记录重写 API 普通日志文件。
+    """用保留记录重写 API 日志文件。
 
     参数:
-        log_path: API 普通日志文件路径。
-        entries: 仍需保留的普通日志记录文本列表。
+        log_path: API 日志文件路径。
+        entries: 仍需保留的日志记录文本列表。
         extra_text: 重报过程中追加到文件尾部、需要继续保留的日志文本。
 
     返回:
@@ -711,35 +606,48 @@ def rewrite_api_log_entries(log_path, entries, extra_text=''):
         file_obj.write(content)
 
 
-def retry_api_error_log_entry(
+def retry_api_log_entry(
     entry_text,
     log_path,
     traffic_upload_url,
     is_compute_server_upload,
-    ip_address
+    ip_address,
+    error_logs=False
 ):
-    """重试单条 API 异常日志中的上报记录。
+    """解析单条历史日志并重报符合过滤规则的记录。
 
     参数:
-        entry_text: 单条 API 异常日志文本。
-        log_path: 当前异常日志文件路径，用于输出诊断日志。
+        entry_text: 单条 API 日志文本。
+        log_path: 日志文件路径，用于诊断。
         traffic_upload_url: 流量上报接口 URL。
-        is_compute_server_upload: 当前是否为算力服务器流量上报模式。
-        ip_address: 算力服务器流量上报使用的当前主机 IP。
+        is_compute_server_upload: 是否为算力服务器上报模式。
+        ip_address: 算力服务器上报使用的主机 IP。
+        error_logs: True 从异常日志取记录，False 根据普通日志查询 SQLite。
 
     返回:
-        bool: 重试成功或无需上报时返回 True，仍需保留异常记录时返回 False。
+        bool: 重报成功或全部被过滤时返回 True；需保留原日志时返回 False。
     """
+    log_desc = 'API 异常日志' if error_logs else 'API 普通日志'
     try:
-        window_start, records = parse_api_error_log_entry(entry_text)
-        upload_records = filter_upload_records_by_mode(
-            records,
-            is_compute_server_upload
-        )
+        if error_logs:
+            window_start, records = parse_api_error_log_entry(entry_text)
+        else:
+            if not is_failed_api_log_entry(entry_text):
+                return False
+            window_start = parse_api_log_window_start(entry_text.splitlines()[0])
+            records = load_records_by_time_id(window_start)
+            if not records:
+                logger.warning(
+                    '普通 API 日志补偿重报未查询到入库记录，文件=%s，time_id=%d',
+                    log_path, window_start
+                )
+                return False
+
+        upload_records = filter_upload_records_by_mode(records, is_compute_server_upload)
         if not upload_records:
             logger.info(
-                "历史 API 异常记录无需重报，已全部被接口过滤规则排除: %s",
-                log_path
+                '%s 无需重报，已全部被接口过滤规则排除，文件=%s，time_id=%d',
+                log_desc, log_path, window_start
             )
             return True
 
@@ -752,119 +660,49 @@ def retry_api_error_log_entry(
         )
         if success:
             logger.info(
-                "历史 API 异常记录重报成功，time_id=%d，记录数=%d，请求次数=%d",
-                window_start,
-                len(upload_records),
-                attempts
+                '%s 重报成功，time_id=%d，记录数=%d，请求次数=%d',
+                log_desc, window_start, len(upload_records), attempts
             )
-            return True
-
-        logger.warning(
-            "历史 API 异常记录重报仍失败，time_id=%d，status=%s，请求次数=%d",
-            window_start,
-            status_code,
-            attempts
-        )
-        return False
-    except Exception as exc:
-        logger.warning("历史 API 异常记录重报失败，文件=%s，原因: %s", log_path, exc)
-        return False
-
-
-def retry_api_log_entry_from_db(
-    entry_text,
-    log_path,
-    traffic_upload_url,
-    is_compute_server_upload,
-    ip_address
-):
-    """根据普通 API 日志中的 window_time 从 SQLite 查询记录并重报。
-
-    参数:
-        entry_text: 单条 API 普通日志文本。
-        log_path: 当前普通日志文件路径，用于输出诊断日志。
-        traffic_upload_url: 流量上报接口 URL。
-        is_compute_server_upload: 当前是否为算力服务器流量上报模式。
-        ip_address: 算力服务器流量上报使用的当前主机 IP。
-
-    返回:
-        bool: 重报成功或无需上报时返回 True，仍需保留普通日志记录时返回 False。
-    """
-    try:
-        entry_lines = entry_text.splitlines()
-        if not entry_lines:
-            raise ValueError("API 普通日志记录为空。")
-        if not is_failed_api_log_entry(entry_text):
-            return False
-
-        window_start = parse_api_log_window_start(entry_lines[0])
-        records = load_records_by_time_id(window_start)
-        if not records:
+        else:
             logger.warning(
-                "普通 API 日志补偿重报未查询到入库记录，文件=%s，time_id=%d",
-                log_path,
-                window_start
+                '%s 重报仍失败，time_id=%d，status=%s，请求次数=%d',
+                log_desc, window_start, status_code, attempts
             )
-            return False
-
-        upload_records = filter_upload_records_by_mode(
-            records,
-            is_compute_server_upload
-        )
-        if not upload_records:
-            logger.info(
-                "普通 API 日志补偿重报无需上报，已全部被接口过滤规则排除，time_id=%d",
-                window_start
-            )
-            return True
-
-        success, status_code, _response_body, attempts = post_upload_records_with_log(
-            upload_records,
-            window_start,
-            traffic_upload_url,
-            is_compute_server_upload,
-            ip_address
-        )
-        if success:
-            logger.info(
-                "普通 API 日志补偿重报成功，time_id=%d，记录数=%d，请求次数=%d",
-                window_start,
-                len(upload_records),
-                attempts
-            )
-            return True
-
-        logger.warning(
-            "普通 API 日志补偿重报仍失败，time_id=%d，status=%s，请求次数=%d",
-            window_start,
-            status_code,
-            attempts
-        )
-        return False
+        return success
     except Exception as exc:
-        logger.warning("普通 API 日志补偿重报失败，文件=%s，原因: %s", log_path, exc)
+        logger.warning('%s 重报失败，保留原记录，文件=%s，原因: %s', log_desc, log_path, exc)
         return False
 
 
-def retry_failed_upload_records_from_api_logs(
+def retry_failed_upload_records_from_logs(
     traffic_upload_url,
     is_compute_server_upload,
-    ip_address
+    ip_address,
+    error_logs=True
 ):
-    """扫描普通 API 日志并补偿重报已入库但上报失败的记录。
+    """扫描历史日志并清理成功重报的记录，无异常日志文件时回退到普通日志。
 
     参数:
         traffic_upload_url: 流量上报接口 URL。
-        is_compute_server_upload: 当前是否为算力服务器流量上报模式。
-        ip_address: 算力服务器流量上报使用的当前主机 IP。
+        is_compute_server_upload: 是否为算力服务器上报模式。
+        ip_address: 算力服务器上报使用的主机 IP。
+        error_logs: True 扫描异常日志，False 扫描普通日志。
 
     返回:
         None: 重报流程结束后不返回业务数据。
     """
+    log_desc = 'API 异常日志' if error_logs else 'API 普通日志'
     try:
-        log_paths = list_api_log_paths()
+        log_paths = list_api_log_paths(error_logs=error_logs)
     except Exception as exc:
-        logger.warning("读取 API 普通日志目录失败，跳过普通日志补偿重报: %s", exc)
+        logger.warning('读取 %s 目录失败，跳过历史重报: %s', log_desc, exc)
+        return
+
+    if error_logs and not log_paths:
+        logger.info('未找到 API 异常日志，开始扫描普通日志补偿重报。')
+        retry_failed_upload_records_from_logs(
+            traffic_upload_url, is_compute_server_upload, ip_address, error_logs=False
+        )
         return
 
     for log_path in log_paths:
@@ -872,130 +710,41 @@ def retry_failed_upload_records_from_api_logs(
             with open(log_path, 'r') as file_obj:
                 log_text = file_obj.read()
         except Exception as exc:
-            logger.warning("读取 API 普通日志失败，文件=%s，原因: %s", log_path, exc)
+            logger.warning('读取 %s 失败，文件=%s，原因: %s', log_desc, log_path, exc)
             continue
 
-        entries = split_api_log_entries(log_text)
-        if not entries:
-            continue
-
+        entries = split_api_log_entries(log_text, error_logs=error_logs)
         remaining_entries = []
-        success_count = 0
         for entry_text in entries:
-            try:
-                should_retry = is_failed_api_log_entry(entry_text)
-            except Exception as exc:
-                logger.warning(
-                    "解析 API 普通日志状态失败，保留原记录，文件=%s，原因: %s",
-                    log_path,
-                    exc
-                )
-                remaining_entries.append(entry_text)
-                continue
-
-            if not should_retry:
-                remaining_entries.append(entry_text)
-                continue
-            if retry_api_log_entry_from_db(
+            if not retry_api_log_entry(
                 entry_text,
                 log_path,
                 traffic_upload_url,
                 is_compute_server_upload,
-                ip_address
+                ip_address,
+                error_logs=error_logs
             ):
-                success_count += 1
-                continue
-            remaining_entries.append(entry_text)
+                remaining_entries.append(entry_text)
 
-        if success_count <= 0:
+        success_count = len(entries) - len(remaining_entries)
+        if not success_count:
             continue
 
         try:
             extra_text = ''
-            with open(log_path, 'r') as file_obj:
-                current_text = file_obj.read()
-            if current_text.startswith(log_text):
-                extra_text = current_text[len(log_text):]
+            # 普通日志在重报期间会追加响应日志，重写时保留这些新增内容。
+            if not error_logs:
+                with open(log_path, 'r') as file_obj:
+                    current_text = file_obj.read()
+                if current_text.startswith(log_text):
+                    extra_text = current_text[len(log_text):]
             rewrite_api_log_entries(log_path, remaining_entries, extra_text)
             logger.info(
-                "已清理 API 普通日志成功补偿重报记录，文件=%s，清理数=%d，保留数=%d",
-                log_path,
-                success_count,
-                len(remaining_entries)
+                '已清理 %s 成功重报记录，文件=%s，清理数=%d，保留数=%d',
+                log_desc, log_path, success_count, len(remaining_entries)
             )
         except Exception as exc:
-            logger.error("重写 API 普通日志失败，文件=%s，原因: %s", log_path, exc)
-
-
-def retry_failed_upload_records_from_error_logs(
-    traffic_upload_url,
-    is_compute_server_upload,
-    ip_address
-):
-    """重报全部月度异常日志中已入库但上报失败的流量记录。
-
-    参数:
-        traffic_upload_url: 流量上报接口 URL。
-        is_compute_server_upload: 当前是否为算力服务器流量上报模式。
-        ip_address: 算力服务器流量上报使用的当前主机 IP。
-
-    返回:
-        None: 重报流程结束后不返回业务数据。
-    """
-    try:
-        log_paths = list_api_error_log_paths()
-    except Exception as exc:
-        logger.warning("读取 API 异常日志目录失败，跳过历史重报: %s", exc)
-        return
-
-    if not log_paths:
-        logger.info("未找到 API 异常日志，开始扫描普通日志补偿重报。")
-        retry_failed_upload_records_from_api_logs(
-            traffic_upload_url,
-            is_compute_server_upload,
-            ip_address
-        )
-        return
-
-    for log_path in log_paths:
-        try:
-            with open(log_path, 'r') as file_obj:
-                log_text = file_obj.read()
-        except Exception as exc:
-            logger.warning("读取 API 异常日志失败，文件=%s，原因: %s", log_path, exc)
-            continue
-
-        entries = split_api_error_log_entries(log_text)
-        if not entries:
-            continue
-
-        remaining_entries = []
-        success_count = 0
-        for entry_text in entries:
-            if retry_api_error_log_entry(
-                entry_text,
-                log_path,
-                traffic_upload_url,
-                is_compute_server_upload,
-                ip_address
-            ):
-                success_count += 1
-                continue
-            remaining_entries.append(entry_text)
-
-        if success_count <= 0:
-            continue
-
-        try:
-            rewrite_api_error_log(log_path, remaining_entries)
-            logger.info(
-                "已清理 API 异常日志成功重报记录，文件=%s，清理数=%d，保留数=%d",
-                log_path,
-                success_count,
-                len(remaining_entries)
-            )
-        except Exception as exc:
-            logger.error("重写 API 异常日志失败，文件=%s，原因: %s", log_path, exc)
+            logger.error('重写 %s 失败，文件=%s，原因: %s', log_desc, log_path, exc)
 
 
 def calculate_upload_bucket_count(spread_window, bucket_seconds):
@@ -1044,7 +793,17 @@ def sleep_until_upload_bucket(window_end, delay_seconds):
 
 
 def post_json(url, payload, headers, timeout):
-    """发送 JSON 格式的 HTTP POST 请求。"""
+    """发送 JSON 格式的 HTTP POST 请求。
+
+    参数:
+        url: 请求目标 URL。
+        payload: 可序列化为 JSON 的数据。
+        headers: 附加请求头，可覆盖默认请求头。
+        timeout: 请求超时秒数。
+
+    返回:
+        tuple: HTTP 状态码和响应体；非 HTTP 响应异常继续抛出。
+    """
     body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
     request_headers = {
         'Content-Type': 'application/json',
@@ -1053,12 +812,8 @@ def post_json(url, payload, headers, timeout):
     request_headers.update(headers or {})
 
     try:
-        if urllib2 is not None:
-            request = urllib2.Request(url, data=body, headers=request_headers)
-            response = urllib2.urlopen(request, timeout=timeout)
-        else:
-            request = urllib_request.Request(url, data=body, headers=request_headers)
-            response = urllib_request.urlopen(request, timeout=timeout)
+        request = urllib_request.Request(url, data=body, headers=request_headers)
+        response = urllib_request.urlopen(request, timeout=timeout)
     except Exception as exc:
         # HTTPError 仍然带有接口响应体，需要作为一次有效请求响应写入日志。
         if hasattr(exc, 'read') and hasattr(exc, 'code'):
@@ -1124,12 +879,22 @@ def calculate_upload_retry_delay(retry_index):
 
 
 def post_json_with_retries(url, payload, headers, timeout, max_retries):
-    """带有限重试机制地发送 JSON 格式 HTTP POST 请求。"""
+    """带有限重试机制地发送 JSON 格式 HTTP POST 请求。
+
+    参数:
+        url: 请求目标 URL。
+        payload: 可序列化为 JSON 的请求数据。
+        headers: 附加请求头。
+        timeout: 单次请求超时秒数。
+        max_retries: 最大重试次数，负整数按零处理。
+
+    返回:
+        tuple: HTTP 状态码、响应体和请求次数；请求异常耗尽重试时抛出异常。
+    """
     if max_retries < 0:
         max_retries = 0
 
     attempts_limit = max_retries + 1
-    last_exc = None
 
     for attempt in range(1, attempts_limit + 1):
         try:
@@ -1150,7 +915,6 @@ def post_json_with_retries(url, payload, headers, timeout, max_retries):
                 delay_seconds
             )
         except Exception as exc:
-            last_exc = exc
             if attempt >= attempts_limit:
                 raise
 
@@ -1164,11 +928,6 @@ def post_json_with_retries(url, payload, headers, timeout, max_retries):
             )
 
         time.sleep(delay_seconds)
-
-    if last_exc is not None:
-        raise last_exc
-
-    raise RuntimeError("流量 API 上报重试流程异常结束。")
 
 
 def post_upload_records_with_log(
@@ -1190,10 +949,7 @@ def post_upload_records_with_log(
     返回:
         tuple: 四元组，依次为是否成功、HTTP 状态码、响应体和请求次数。
     """
-    if is_compute_server_upload:
-        payload = build_compute_server_traffic_payload(records, ip_address)
-    else:
-        payload = build_traffic_payload(records)
+    payload = build_traffic_payload(records, is_compute_server_upload, ip_address)
     status_code, response_body, attempts = post_json_with_retries(
         traffic_upload_url,
         payload,
@@ -1243,7 +999,7 @@ def upload_traffic_records(
     返回:
         None: 上报流程结束后不返回业务数据。
     """
-    retry_failed_upload_records_from_error_logs(
+    retry_failed_upload_records_from_logs(
         traffic_upload_url,
         is_compute_server_upload,
         ip_address
@@ -1318,25 +1074,29 @@ def create_table(cursor):
 
 
 def get_table_columns(cursor, table_name):
-    """读取指定表的列信息。"""
+    """读取表的原始列定义，供统一标准化后比对。
+
+    参数:
+        cursor: SQLite cursor。
+        table_name: 待读取的表名。
+
+    返回:
+        list: 列名与原始类型组成的二元组列表。
+    """
     cursor.execute("PRAGMA table_info({0})".format(table_name))
-    rows = cursor.fetchall()
-    columns = []
-
-    for row in rows:
-        columns.append((row[1], (row[2] or '').upper()))
-
-    return columns
+    return [(row[1], row[2]) for row in cursor.fetchall()]
 
 
 def normalize_columns(columns):
-    """将列定义标准化，便于做表结构比对。"""
-    normalized = []
+    """统一列类型的空值和大小写，便于比对表结构。
 
-    for name, col_type in columns:
-        normalized.append((name, (col_type or '').upper()))
+    参数:
+        columns: 列名与类型组成的二元组序列。
 
-    return normalized
+    返回:
+        list: 类型为空字符串或大写字符串的列定义列表。
+    """
+    return [(name, (col_type or '').upper()) for name, col_type in columns]
 
 
 def ensure_table_schema(conn, cursor):
@@ -1713,32 +1473,30 @@ def build_record(window_start, iface, counter_deltas, elapsed):
         LONG_TYPE(window_start),
         iface,
         mac,
-        LONG_TYPE(rx_speed_rounded),
-        LONG_TYPE(tx_speed_rounded)
+        rx_speed_rounded,
+        tx_speed_rounded
     )
 
 
-def resolve_window_ifaces(prev_counters, cur_counters, is_compute_server_upload):
+def resolve_window_ifaces(counters, is_compute_server_upload):
     """根据上报模式确定当前窗口需要记录的网卡列表。
 
     参数:
-        prev_counters: 窗口起点采集到的网卡累计计数器。
-        cur_counters: 窗口终点采集到的网卡累计计数器。
+        counters: 已通过窗口异常检查的网卡计数器，起点与终点接口集合相同。
         is_compute_server_upload: 当前是否为算力服务器流量上报模式。
 
     返回:
         list: 当前窗口需要生成记录的网卡名称列表。
     """
-    all_ifaces = set(prev_counters.keys()) | set(cur_counters.keys())
     if is_compute_server_upload:
-        if COMPUTE_SERVER_TRAFFIC_IFACE not in all_ifaces:
+        if COMPUTE_SERVER_TRAFFIC_IFACE not in counters:
             logger.warning(
                 "算力服务器流量上报模式未找到 %s 网卡，本窗口不会生成记录。",
                 COMPUTE_SERVER_TRAFFIC_IFACE
             )
             return []
         return [COMPUTE_SERVER_TRAFFIC_IFACE]
-    return sorted(all_ifaces)
+    return sorted(counters)
 
 
 # ── 整五分钟对齐 ──────────────────────────────────────────────────────────────
@@ -1848,15 +1606,11 @@ def process_window_records(
         vlan_children_by_parent
     )
     records = []
-    for iface in resolve_window_ifaces(
-        prev_counters,
-        cur_counters,
-        is_compute_server_upload
-    ):
+    for iface in resolve_window_ifaces(prev_counters, is_compute_server_upload):
         record = build_record(
             window_start,
             iface,
-            adjusted_counter_deltas.get(iface, {}),
+            adjusted_counter_deltas[iface],
             elapsed
         )
         if record is None:
@@ -1954,41 +1708,11 @@ def main(traffic_api_post, traffic_upload_url, ip_address):
             format_beijing_time(baseline_ts)
         )
         sleep_until(baseline_ts)
-        prev_counters = read_net_dev()
-        prev_sample_time = time.time()
-        log_iface_snapshot(prev_counters)
-    else:
-        prev_counters = read_net_dev()
-        prev_sample_time = time.time()
-        log_iface_snapshot(prev_counters)
+        window_start = baseline_ts
 
-        logger.info(
-            "首次启动采样已开始，启动所在窗口 time_id=%d，"
-            "等待窗口结束点（北京时间）: %s",
-            window_start,
-            format_beijing_time(baseline_ts)
-        )
-        sleep_until(baseline_ts)
-
-        cur_counters = read_net_dev()
-        cur_sample_time = time.time()
-        elapsed = cur_sample_time - prev_sample_time
-
-        process_window_records(
-            window_start,
-            prev_counters,
-            cur_counters,
-            elapsed,
-            traffic_api_post,
-            baseline_ts,
-            traffic_upload_url,
-            is_compute_server_upload,
-            ip_address
-        )
-
-        prev_counters = cur_counters
-        prev_sample_time = cur_sample_time
-    window_start = baseline_ts
+    prev_counters = read_net_dev()
+    prev_sample_time = time.time()
+    log_iface_snapshot(prev_counters)
 
     while True:
         target_ts = window_start + INTERVAL

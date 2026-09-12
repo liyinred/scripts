@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 # Author: wenhao
 """批量通过 SSH 安装并启动外网流量监控脚本。
 

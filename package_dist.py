@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 # Author: wenhao
 """将 frontend/dist 目录压缩并输出到 scripts/dist.zip。"""
 

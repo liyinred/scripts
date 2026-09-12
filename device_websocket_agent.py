@@ -31,6 +31,12 @@ import struct
 import subprocess
 import sys
 import time
+import threading
+
+try:
+    from Queue import Queue, Empty
+except ImportError:
+    from queue import Queue, Empty
 
 try:
     from urllib import quote
@@ -137,27 +143,27 @@ def read_text_file(path):
         return None
 
 
-def run_command(command, allow_nonzero=False):
-    """执行本机命令并读取标准输出。
+def run_command(command, allow_nonzero=False, error_label=None, env=None):
+    """执行命令并解码输出。
 
-    功能：执行指定命令并返回 UTF-8 标准输出，可按需保留非零退出码时的输出。
-    参数：command 为 subprocess 命令参数；allow_nonzero 表示是否接受非零退出码。
-    返回值：str 或 None，成功且有输出时返回文本，否则返回 None。
+    参数：command 为 argv，allow_nonzero 接受非零退出码，error_label 指定失败时抛出的错误前缀，env 为环境。
+    返回值：文本或 None。
     """
     try:
         process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
         )
-        stdout_data, _stderr_data = process.communicate()
-        if process.returncode != 0 and not allow_nonzero:
-            return None
-        if not stdout_data:
-            return None
-        return stdout_data.decode("utf-8", "ignore").strip()
-    except OSError:
+        stdout_data, stderr_data = process.communicate()
+    except OSError as exc:
+        if error_label:
+            raise RuntimeError("无法启动%s: %s" % (error_label, exc))
         return None
+    if process.returncode != 0 and not allow_nonzero:
+        if error_label:
+            error_text = (stderr_data or stdout_data or b"").decode("utf-8", "ignore").strip()
+            raise RuntimeError(error_text or "%s执行失败，退出码 %s" % (error_label, process.returncode))
+        return None
+    return stdout_data.decode("utf-8", "ignore").strip() if stdout_data else None
 
 
 def validate_upload_limit_config(start, end, rate):
@@ -196,19 +202,9 @@ def execute_upload_limit_command(enabled, start=20, end=22, rate=50):
         command = ENABLE_UPLOAD_LIMIT_COMMAND.format(start=start, end=end, rate=rate)
     else:
         command = DISABLE_UPLOAD_LIMIT_COMMAND
-    try:
-        process = subprocess.Popen(
-            ["/bin/bash", "-o", "pipefail", "-c", command],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        stdout_data, stderr_data = process.communicate()
-    except OSError as exc:
-        raise RuntimeError("无法启动限速命令: %s" % exc)
-    if process.returncode != 0:
-        error_data = stderr_data or stdout_data or b""
-        error_text = error_data.decode("utf-8", "ignore").strip()
-        raise RuntimeError(error_text or "限速命令执行失败，退出码 %s" % process.returncode)
+    run_command(
+        ["/bin/bash", "-o", "pipefail", "-c", command], error_label="限速命令"
+    )
     return {}
 
 
@@ -290,22 +286,11 @@ def execute_bandwidth_test(server_ip, duration_seconds):
     )
     command_environment = os.environ.copy()
     command_environment["LC_ALL"] = "C"
-    try:
-        process = subprocess.Popen(
-            ["iperf3", "-c", server_ip, "-t", str(duration_seconds)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=command_environment,
-        )
-        stdout_data, stderr_data = process.communicate()
-    except OSError as exc:
-        raise RuntimeError("无法启动 iperf3: %s" % exc)
-    if process.returncode != 0:
-        error_data = stderr_data or stdout_data or b""
-        error_text = error_data.decode("utf-8", "ignore").strip()
-        raise RuntimeError(error_text or "iperf3 执行失败，退出码 %s" % process.returncode)
-    output_text = (stdout_data or b"").decode("utf-8", "ignore")
-    return parse_iperf3_bandwidth_test_output(output_text)
+    output = run_command(
+        ["iperf3", "-c", server_ip, "-t", str(duration_seconds)],
+        error_label="iperf3", env=command_environment,
+    )
+    return parse_iperf3_bandwidth_test_output(output)
 
 
 def parse_tcp_port(port_text):
@@ -440,28 +425,27 @@ def read_memory_info_kb():
     return memory_info
 
 
-def read_total_memory_bytes():
+def read_total_memory_bytes(memory_info):
     """读取主机总内存字节数。
 
     功能：读取 /proc/meminfo 中的 MemTotal 并转换为 bytes。
-    参数：无。
+    参数：memory_info 为一次采集得到的 /proc/meminfo 字段。
     返回值：int 或 None，成功时返回总内存 bytes，读取失败时返回 None。
     """
-    total_memory_kb = read_memory_info_kb().get("MemTotal")
+    total_memory_kb = memory_info.get("MemTotal")
     if total_memory_kb is None:
         return None
     return total_memory_kb * 1024
 
 
-def read_used_memory_bytes():
+def read_used_memory_bytes(memory_info):
     """读取主机占用内存字节数。
 
     功能：优先按 MemTotal - MemAvailable 计算占用内存；MemAvailable 缺失时使用
         MemFree、Buffers 和 Cached 估算可用内存后再计算。
-    参数：无。
+    参数：memory_info 为一次采集得到的 /proc/meminfo 字段。
     返回值：int 或 None，成功时返回占用内存 bytes，读取失败时返回 None。
     """
-    memory_info = read_memory_info_kb()
     total_memory_kb = memory_info.get("MemTotal")
     if total_memory_kb is None:
         return None
@@ -539,7 +523,7 @@ def parse_lsblk_disk_kinds(output):
 
 
 def parse_lsblk_disk_info(
-    output,
+    rows,
     disk_kinds,
     disk_used_bytes_overrides=None,
 ):
@@ -547,7 +531,7 @@ def parse_lsblk_disk_info(
 
     功能：读取 lsblk -P -b -n 输出，按预先识别的磁盘介质类型汇总物理磁盘容量、
         数量和基础明细。
-    参数：output 为 lsblk 命令标准输出文本；disk_kinds 为按物理磁盘名称记录的
+    参数：rows 为已解析的 lsblk 字段列表；disk_kinds 为按物理磁盘名称记录的
         SSD/HDD 类型；disk_used_bytes_overrides 为按物理磁盘名称提供的占用空间
         覆盖值，通常来源于 df。
     返回值：dict，包含 SSD/HDD 汇总字段和 diskDetails 基础明细；明细健康度默认为 UNKNOWN。
@@ -558,8 +542,7 @@ def parse_lsblk_disk_info(
     hdd_count = 0
     disk_rows = []
     disk_used_bytes = {}
-    for line in (output or "").splitlines():
-        fields = parse_lsblk_pairs(line)
+    for fields in rows:
         device_name = fields.get("NAME")
         device_type = fields.get("TYPE")
         if device_type == "disk":
@@ -757,24 +740,25 @@ def collect_mountpoint_used_bytes(mountpoint):
     return parse_df_used_bytes(run_command(["df", "-B1", "-P", mountpoint]))
 
 
-def collect_disk_used_bytes(output):
+def collect_disk_used_bytes(rows):
     """按物理磁盘汇总已挂载文件系统占用空间。
 
     功能：从 lsblk 输出提取磁盘及分区挂载点，通过 df 获取占用空间并按父级
         物理磁盘名称求和。
-    参数：output 为 lsblk -P 输出文本。
+    参数：rows 为已解析的 lsblk 字段列表。
     返回值：dict，key 为物理磁盘名称，value 为其文件系统占用总字节数。
     """
     disk_used_bytes = {}
-    for line in (output or "").splitlines():
-        fields = parse_lsblk_pairs(line)
+    for fields in rows:
         device_name = fields.get("NAME")
         if fields.get("TYPE") == "disk":
             parent_device_name = device_name
         else:
             parent_device_name = get_partition_parent_device_name(device_name)
+        if not is_physical_block_device(parent_device_name):
+            continue
         used_bytes = collect_mountpoint_used_bytes(fields.get("MOUNTPOINT"))
-        if not parent_device_name or used_bytes is None:
+        if used_bytes is None:
             continue
         disk_used_bytes[parent_device_name] = (
             disk_used_bytes.get(parent_device_name, 0) + used_bytes
@@ -835,11 +819,8 @@ def collect_disk_info():
             "hddCount": None,
             "diskDetails": [],
         }
-    disk_info = parse_lsblk_disk_info(
-        lsblk_output,
-        disk_kinds,
-        collect_disk_used_bytes(lsblk_output),
-    )
+    rows = [parse_lsblk_pairs(line) for line in lsblk_output.splitlines()]
+    disk_info = parse_lsblk_disk_info(rows, disk_kinds, collect_disk_used_bytes(rows))
     disk_iops = collect_disk_iops()
     for disk_detail in disk_info["diskDetails"]:
         current_disk_iops = disk_iops.get(disk_detail["name"], {})
@@ -958,51 +939,62 @@ def read_network_interface_mac(interface_name):
     return normalize_mac_address(read_text_file(address_path))
 
 
-def collect_network_interface_mac_addresses():
-    """采集可用于在线主机匹配的网络接口 MAC 地址。
+def collect_base_network_interfaces():
+    """采集有效接口。
 
-    功能：遍历 /proc/net/dev 中的 iface，排除 lo、docker0 和无效 MAC，并对结果去重。
     参数：无。
-    返回值：list[str]，按接口出现顺序返回过滤、规范化并去重后的 MAC 地址。
+    返回值：按原始顺序排列的 name、macAddress 字典列表。
     """
-    content = read_text_file(PROC_NET_DEV_PATH)
-    mac_addresses = []
-    seen_mac_addresses = set()
-    for interface_name in parse_proc_net_dev_interfaces(content):
-        if interface_name in IGNORED_PUBLIC_IP_INTERFACE_NAMES:
+    interfaces = []
+    for name in parse_proc_net_dev_interfaces(read_text_file(PROC_NET_DEV_PATH)):
+        if name in IGNORED_PUBLIC_IP_INTERFACE_NAMES:
             continue
-        mac_address = read_network_interface_mac(interface_name)
-        if not mac_address or mac_address in seen_mac_addresses:
-            continue
-        seen_mac_addresses.add(mac_address)
-        mac_addresses.append(mac_address)
-    return mac_addresses
+        mac = read_network_interface_mac(name)
+        if mac:
+            interfaces.append({"name": name, "macAddress": mac})
+    return interfaces
 
 
-def collect_interface_ipv6_addresses(interface_name):
-    """读取单个网络接口的 IPv6 地址列表。
+def collect_network_interface_mac_addresses():
+    """采集去重 MAC。
 
-    功能：解析 /proc/net/if_inet6，返回指定 iface 的 IPv6 地址文本。
-    参数：interface_name 为网络接口名称。
-    返回值：list[str]，读取失败或无地址时返回空列表。
+    参数：无。
+    返回值：按接口顺序排列的 MAC 文本列表。
+    """
+    addresses = []
+    seen = set()
+    for interface in collect_base_network_interfaces():
+        mac = interface["macAddress"]
+        if mac not in seen:
+            seen.add(mac)
+            addresses.append(mac)
+    return addresses
+
+
+def collect_interface_ipv6_addresses():
+    """一次读取所有接口 IPv6。
+
+    参数：无。
+    返回值：接口名称到地址列表的字典。
     """
     content = read_text_file("/proc/net/if_inet6")
     if not content:
-        return []
-    addresses = []
+        return {}
+    addresses = {}
     for line in content.splitlines():
         parts = line.split()
-        if len(parts) < 6 or parts[-1] != interface_name:
+        if len(parts) < 6:
             continue
         raw_address = parts[0]
         if len(raw_address) != 32:
             continue
+        interface_addresses = addresses.setdefault(parts[-1], [])
         chunks = [raw_address[index : index + 4] for index in range(0, 32, 4)]
         try:
             packed_address = socket.inet_pton(socket.AF_INET6, ":".join(chunks))
-            addresses.append(socket.inet_ntop(socket.AF_INET6, packed_address))
+            interface_addresses.append(socket.inet_ntop(socket.AF_INET6, packed_address))
         except (AttributeError, socket.error):
-            addresses.append(":".join(chunks))
+            interface_addresses.append(":".join(chunks))
     return addresses
 
 
@@ -1051,24 +1043,16 @@ def collect_network_interfaces():
     返回值：list[dict]，每项包含 name、macAddress、ipv4Addresses、ipv6Addresses、
         publicIpv4 和 publicIpv6 字段。
     """
-    content = read_text_file(PROC_NET_DEV_PATH)
-    interfaces = []
-    for interface_name in parse_proc_net_dev_interfaces(content):
-        if interface_name in IGNORED_PUBLIC_IP_INTERFACE_NAMES:
-            continue
-        mac_address = read_network_interface_mac(interface_name)
-        if not mac_address:
-            continue
-        interfaces.append(
-            {
-                "name": interface_name,
-                "macAddress": mac_address,
-                "ipv4Addresses": [],
-                "ipv6Addresses": collect_interface_ipv6_addresses(interface_name),
-                "publicIpv4": read_public_ip_with_interface(interface_name, 4),
-                "publicIpv6": read_public_ip_with_interface(interface_name, 6),
-            }
-        )
+    interfaces = collect_base_network_interfaces()
+    ipv6_addresses = collect_interface_ipv6_addresses()
+    for interface in interfaces:
+        name = interface["name"]
+        interface.update({
+            "ipv4Addresses": [],
+            "ipv6Addresses": ipv6_addresses.get(name, []),
+            "publicIpv4": read_public_ip_with_interface(name, 4),
+            "publicIpv6": read_public_ip_with_interface(name, 6),
+        })
     return interfaces
 
 
@@ -1102,10 +1086,11 @@ def collect_system_info():
     """
     lscpu_fields = read_lscpu_fields()
     disk_info = collect_disk_info()
+    memory_info = read_memory_info_kb()
     return {
         "osImageVersion": read_os_image_version(),
-        "totalMemory": read_total_memory_bytes(),
-        "usedMemory": read_used_memory_bytes(),
+        "totalMemory": read_total_memory_bytes(memory_info),
+        "usedMemory": read_used_memory_bytes(memory_info),
         "ssdTotalDisk": disk_info.get("ssdTotalDisk"),
         "hddTotalDisk": disk_info.get("hddTotalDisk"),
         "ssdCount": disk_info.get("ssdCount"),
@@ -1180,25 +1165,42 @@ def parse_websocket_url(websocket_url):
 
 
 def create_socket_connection(scheme, host, port, timeout_seconds):
-    """创建 TCP 或 TLS socket 连接。"""
+    """创建 TCP/TLS 连接。
+
+    参数：scheme 为 ws/wss，host、port 为地址，timeout_seconds 为超时秒数。
+    返回值：已连接的 socket。
+    """
     raw_socket = socket.create_connection((host, port), timeout_seconds)
-    raw_socket.settimeout(timeout_seconds)
-    if scheme == "wss":
+    if scheme != "wss":
+        return raw_socket
+    try:
+        if hasattr(ssl, "SSLContext"):
+            context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            return context.wrap_socket(raw_socket, server_hostname=host)
         return ssl.wrap_socket(raw_socket)
-    return raw_socket
+    except Exception:
+        raw_socket.close()
+        raise
 
 
 def read_http_headers(sock):
-    """读取 WebSocket 握手响应头。"""
-    data = ""
-    while "\r\n\r\n" not in data:
+    """读取握手头并保留后续帧。
+
+    参数：sock 为 socket。
+    返回值：头部文本和剩余 bytes。
+    """
+    data = b""
+    while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
         if not chunk:
             raise RuntimeError("empty websocket handshake response")
         data += chunk
-        if len(data) > 65536:
+        if data.find(b"\r\n\r\n") > 65536 or (
+            b"\r\n\r\n" not in data and len(data) > 65536
+        ):
             raise RuntimeError("websocket handshake response header too large")
-    return data.split("\r\n\r\n", 1)[0]
+    headers, remaining = data.split(b"\r\n\r\n", 1)
+    return headers.decode("iso-8859-1"), remaining
 
 
 def parse_header_map(header_text):
@@ -1212,7 +1214,11 @@ def parse_header_map(header_text):
 
 
 def perform_websocket_handshake(sock, host, port, path):
-    """执行 WebSocket 客户端握手。"""
+    """执行握手。
+
+    参数：sock、host、port、path 为连接信息。
+    返回值：握手后剩余 bytes。
+    """
     nonce = base64.b64encode(os.urandom(16)).decode("ascii")
     host_header = host if port in (80, 443) else "%s:%s" % (host, port)
     request = (
@@ -1227,7 +1233,7 @@ def perform_websocket_handshake(sock, host, port, path):
     if isinstance(request, TEXT_TYPE):
         request = request.encode("ascii")
     sock.sendall(request)
-    header_text = read_http_headers(sock)
+    header_text, remaining = read_http_headers(sock)
     status_line = header_text.split("\r\n", 1)[0]
     if " 101 " not in status_line:
         raise RuntimeError("websocket handshake failed: %s" % status_line)
@@ -1238,31 +1244,28 @@ def perform_websocket_handshake(sock, host, port, path):
     actual_accept = headers.get("sec-websocket-accept")
     if actual_accept != expected_accept:
         raise RuntimeError("websocket Sec-WebSocket-Accept validation failed")
-
-
-def recv_exact(sock, length):
-    """从 socket 精确读取指定长度字节。"""
-    chunks = []
-    remaining = length
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise RuntimeError("websocket connection closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return "".join(chunks)
+    return remaining
 
 
 def mask_payload(payload, mask_key):
-    """按 WebSocket 协议 mask 或 unmask payload。"""
-    return "".join(
-        chr(ord(payload[index]) ^ ord(mask_key[index % 4]))
-        for index in range(len(payload))
-    )
+    """执行 mask/unmask。
+
+    参数：payload 和 mask_key 为 bytes。
+    返回值：处理后的 bytes。
+    """
+    key = bytearray(mask_key)
+    return bytes(bytearray(
+        value ^ key[index % 4]
+        for index, value in enumerate(bytearray(payload))
+    ))
 
 
 def send_websocket_frame(sock, opcode, payload):
-    """发送 WebSocket 帧。"""
+    """发送帧。
+
+    参数：sock 为 socket、opcode 为操作码、payload 为内容。
+    返回值：None。
+    """
     if isinstance(payload, TEXT_TYPE):
         payload = payload.encode("utf-8")
     payload_length = len(payload)
@@ -1278,48 +1281,65 @@ def send_websocket_frame(sock, opcode, payload):
     sock.sendall(header + mask_key + mask_payload(payload, mask_key))
 
 
-def recv_websocket_frame(sock):
-    """接收单个 WebSocket 帧。"""
-    first_two = recv_exact(sock, 2)
-    byte_one, byte_two = struct.unpack("!BB", first_two)
-    fin = (byte_one & 0x80) != 0
-    opcode = byte_one & 0x0F
-    masked = (byte_two & 0x80) != 0
-    payload_length = byte_two & 0x7F
-    if payload_length == 126:
-        payload_length = struct.unpack("!H", recv_exact(sock, 2))[0]
-    elif payload_length == 127:
-        payload_length = struct.unpack("!Q", recv_exact(sock, 8))[0]
-    mask_key = recv_exact(sock, 4) if masked else None
-    payload = recv_exact(sock, payload_length) if payload_length else ""
-    if mask_key:
-        payload = mask_payload(payload, mask_key)
-    return fin, opcode, payload
+class WebSocketReader(object):
+    """保留尚未完整接收的帧及文本分片。"""
 
+    def __init__(self, data=b""):
+        """初始化缓冲。
 
-def recv_websocket_message(sock):
-    """接收一条完整 WebSocket 文本消息。"""
-    fragments = []
-    expected_continuation = False
-    while True:
-        fin, opcode, payload = recv_websocket_frame(sock)
-        if opcode == OPCODE_CLOSE:
-            return None
-        if opcode == OPCODE_PING:
-            send_websocket_frame(sock, OPCODE_PONG, payload)
-            continue
-        if opcode == OPCODE_PONG:
-            continue
-        if opcode == OPCODE_TEXT:
-            fragments.append(payload)
-            expected_continuation = not fin
-        elif opcode == OPCODE_CONTINUATION and expected_continuation:
-            fragments.append(payload)
-            expected_continuation = not fin
-        else:
-            raise RuntimeError("unsupported websocket frame opcode=%s" % opcode)
-        if fin:
-            return "".join(fragments).decode("utf-8", "ignore")
+        参数：data 为握手后剩余 bytes。
+        返回值：None。
+        """
+        self.buffer = data
+        self.fragments = []
+        self.fragmented = False
+
+    def receive(self, sock):
+        """解析已有缓冲。
+
+        参数：sock 用于回复 Ping。
+        返回值：文本消息列表，关闭以 None 表示。
+        """
+        messages = []
+        while len(self.buffer) >= 2:
+            first, second = struct.unpack("!BB", self.buffer[:2])
+            fin, opcode = bool(first & 0x80), first & 0x0F
+            length, offset = second & 0x7F, 2
+            if length in (126, 127):
+                size = 2 if length == 126 else 8
+                if len(self.buffer) < offset + size:
+                    break
+                length = struct.unpack(
+                    "!H" if size == 2 else "!Q", self.buffer[2:2 + size]
+                )[0]
+                offset += size
+            masked = bool(second & 0x80)
+            payload_offset = offset + (4 if masked else 0)
+            if len(self.buffer) < payload_offset + length:
+                break
+            payload = self.buffer[payload_offset:payload_offset + length]
+            if masked:
+                payload = mask_payload(payload, self.buffer[offset:offset + 4])
+            self.buffer = self.buffer[payload_offset + length:]
+            if opcode == OPCODE_CLOSE:
+                messages.append(None)
+                break
+            if opcode == OPCODE_PING:
+                send_websocket_frame(sock, OPCODE_PONG, payload)
+                continue
+            if opcode == OPCODE_PONG:
+                continue
+            if opcode == OPCODE_TEXT and not self.fragmented:
+                self.fragments = [payload]
+            elif opcode == OPCODE_CONTINUATION and self.fragmented:
+                self.fragments.append(payload)
+            else:
+                raise RuntimeError("unsupported websocket frame opcode=%s" % opcode)
+            self.fragmented = not fin
+            if fin:
+                messages.append(b"".join(self.fragments).decode("utf-8", "ignore"))
+                self.fragments = []
+        return messages
 
 
 def send_json_message(sock, payload):
@@ -1547,23 +1567,12 @@ def handle_terminal_message(sock, payload, terminal_sessions):
             )
 
 
-def flush_terminal_outputs(sock, terminal_sessions):
-    """读取并上报所有可读终端输出。
+def flush_terminal_outputs(sock, terminal_sessions, fd_to_session, readable_fds):
+    """上报就绪终端输出。
 
-    功能：遍历当前 pty fd，读取可用输出并通过设备 WebSocket 推送给后端。
-    参数：sock 为设备 WebSocket socket；terminal_sessions 为会话字典。
+    参数：sock 为连接，terminal_sessions 为会话表，fd_to_session 为 fd 映射，readable_fds 为就绪列表。
     返回值：None。
     """
-    fd_to_session = {
-        session.fd: session
-        for session in terminal_sessions.values()
-        if session.fd is not None
-    }
-    if not fd_to_session:
-        return
-    readable_fds, _writable, _errors = select.select(
-        list(fd_to_session.keys()), [], [], 0
-    )
     for fd in readable_fds:
         session = fd_to_session.get(fd)
         if session is None:
@@ -1590,54 +1599,104 @@ def flush_terminal_outputs(sock, terminal_sessions):
         )
 
 
-def handle_websocket_session(websocket_url, timeout_seconds):
-    """建立并处理一次 WebSocket 会话。"""
+class CommandWorker(object):
+    """跨重连复用的串行命令 worker，避免耗时命令阻塞 socket。"""
+
+    def __init__(self):
+        """启动后台 worker。
+
+        参数：无。
+        返回值：None。
+        """
+        self.jobs = Queue()
+        thread = threading.Thread(target=self.run)
+        thread.daemon = True
+        thread.start()
+
+    def run(self):
+        """顺序执行有效会话的任务。
+
+        参数：无。
+        返回值：None，持续运行。
+        """
+        while True:
+            payload, results, active = self.jobs.get()
+            try:
+                if active.is_set():
+                    response = build_command_response(payload)
+                    if active.is_set():
+                        results.put(response)
+            finally:
+                self.jobs.task_done()
+
+
+def handle_websocket_session(websocket_url, timeout_seconds, command_worker):
+    """处理连接。
+
+    参数：websocket_url、timeout_seconds 为连接配置，command_worker 为共享 worker。
+    返回值：None。
+    """
     scheme, host, port, path = parse_websocket_url(websocket_url)
     sock = create_socket_connection(scheme, host, port, timeout_seconds)
     terminal_sessions = {}
+    results = Queue()
+    active = threading.Event()
+    active.set()
+    pending_commands = 0
     try:
-        perform_websocket_handshake(sock, host, port, path)
+        reader = WebSocketReader(perform_websocket_handshake(sock, host, port, path))
         logger.info("websocket connected")
+        last_received = time.time()
         while True:
-            flush_terminal_outputs(sock, terminal_sessions)
-            read_targets = [sock] + [
-                session.fd
-                for session in terminal_sessions.values()
+            for message in reader.receive(sock):
+                if message is None:
+                    logger.info("backend closed websocket connection")
+                    return
+                payload = json.loads(message)
+                if payload.get("type") == "command":
+                    command_worker.jobs.put((payload, results, active))
+                    pending_commands += 1
+                elif payload.get("type") in (
+                    "terminal_start", "terminal_input", "terminal_resize", "terminal_close"
+                ):
+                    handle_terminal_message(sock, payload, terminal_sessions)
+            while True:
+                try:
+                    response = results.get_nowait()
+                except Empty:
+                    break
+                pending_commands -= 1
+                send_json_message(sock, response)
+            fd_to_session = {
+                session.fd: session for session in terminal_sessions.values()
                 if session.fd is not None
-            ]
+            }
+            wait_seconds = max(0, timeout_seconds - (time.time() - last_received))
+            if pending_commands:
+                wait_seconds = min(wait_seconds, 0.1)
+            tls_pending = isinstance(sock, ssl.SSLSocket) and sock.pending() > 0
             readable, _writable, _errors = select.select(
-                read_targets, [], [], timeout_seconds
+                [sock] + list(fd_to_session), [], [], 0 if tls_pending else wait_seconds
             )
-            if not readable:
-                send_websocket_frame(sock, OPCODE_PING, "")
-                continue
-            if sock not in readable:
-                continue
-            message = recv_websocket_message(sock)
-            if message is None:
-                logger.info("backend closed websocket connection")
-                return
-            payload = json.loads(message)
-            if payload.get("type") == "command":
-                send_json_message(sock, build_command_response(payload))
-            elif payload.get("type") in (
-                "terminal_start",
-                "terminal_input",
-                "terminal_resize",
-                "terminal_close",
-            ):
-                handle_terminal_message(sock, payload, terminal_sessions)
+            flush_terminal_outputs(sock, terminal_sessions, fd_to_session, readable)
+            if sock in readable or tls_pending:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return
+                reader.buffer += chunk
+                last_received = time.time()
+            elif time.time() - last_received >= timeout_seconds:
+                send_websocket_frame(sock, OPCODE_PING, b"")
+                last_received = time.time()
     finally:
+        active.clear()
         for session in list(terminal_sessions.values()):
             session.close()
         try:
-            send_websocket_frame(sock, OPCODE_CLOSE, "")
+            send_websocket_frame(sock, OPCODE_CLOSE, b"")
         except Exception:
             pass
-        try:
-            sock.close()
-        except Exception:
-            pass
+        sock.close()
 
 
 def parse_args(argv):
@@ -1690,11 +1749,12 @@ def main(argv):
         logger.error("%s", exc)
         return 2
 
+    command_worker = CommandWorker()
     logger.info("device_id=%s", device_id)
     logger.info("websocket_url=%s", websocket_url)
     while True:
         try:
-            handle_websocket_session(websocket_url, args.socket_timeout)
+            handle_websocket_session(websocket_url, args.socket_timeout, command_worker)
         except KeyboardInterrupt:
             logger.info("interrupted, exit")
             return 0

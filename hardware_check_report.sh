@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Author: wenhao
+# 功能：检查服务器系统及 CPU、内存、GPU、网卡、SSD 信息，测试磁盘 IOPS 并输出硬件检测报告。
 # Example:
 # sudo bash hardware_check_report.sh
+# curl -fSL "https://gitee.com/liyinred/scripts/raw/master/hardware_check_report.sh" | sudo bash
 
 HOST_NAME=$(hostname)
 REPORT_DATE=$(date "+%Y-%m-%d %H:%M:%S %Z (%z)")
@@ -12,7 +14,7 @@ if [ -r /etc/machine-id ]; then
 fi
 FIO_SIZE="100G"
 FIO_MIN_AVAILABLE_BYTES=$((110 * 1024 * 1024 * 1024))
-PUBLIC_IP_LOOKUP_URL="https://ifconfig.co/ip"
+PUBLIC_IP_LOOKUP_URL="https://4.itdog.cn"
 
 # 功能：检查报告和压测所需工具，并通过 yum 或 apt 安装缺失的软件包。
 # 参数：无。

@@ -25,6 +25,12 @@ import random
 import ast
 import re
 import calendar
+import threading
+
+try:
+    import Queue as queue
+except ImportError:
+    import queue
 
 try:
     import fcntl
@@ -59,8 +65,8 @@ DEFAULT_MAC = '00:00:00:00:00:00'   # MAC 获取失败时的兜底值
 BEIJING_UTC_OFFSET = 8 * 60 * 60    # 北京时间固定为 UTC+8
 TRAFFIC_UPLOAD_URL = None
 TRAFFIC_UPLOAD_API_KEY = 'xiaohe666'
-TRAFFIC_UPLOAD_TIMEOUT = 20        # 流量上报接口请求超时时间，单位：秒
-TRAFFIC_UPLOAD_MAX_RETRIES = 5     # 流量上报失败后的最大重试次数
+TRAFFIC_UPLOAD_TIMEOUT = 5         # 流量上报接口请求超时时间，单位：秒
+TRAFFIC_UPLOAD_MAX_RETRIES = 3     # 流量上报失败后的最大重试次数
 TRAFFIC_UPLOAD_RETRY_BASE_DELAY = 1.0  # 流量上报重试基础等待时间，单位：秒
 TRAFFIC_UPLOAD_RETRY_MAX_DELAY = 16.0  # 流量上报单次重试最大等待时间，单位：秒
 TRAFFIC_UPLOAD_SPREAD_WINDOW = 10.0  # 窗口结束后上报分散时间范围，单位：秒
@@ -1554,6 +1560,49 @@ def log_iface_snapshot(counters):
 
 # ── 主循环 ───────────────────────────────────────────────────────────────────
 
+def run_upload_worker(upload_queue, traffic_upload_url, is_compute_server_upload, ip_address):
+    """在单个后台线程中串行执行窗口上报及历史补报。
+
+    参数:
+        upload_queue: 保存 records、window_start 和 window_end 的无界 Queue。
+        traffic_upload_url: 流量上报接口 URL。
+        is_compute_server_upload: 是否为算力服务器上报模式。
+        ip_address: 算力服务器上报使用的主机 IP。
+
+    返回:
+        None: 持续等待并处理任务，不返回业务数据。
+    """
+    while True:
+        records, window_start, window_end = upload_queue.get()
+        try:
+            upload_delay_seconds, upload_bucket_index, upload_bucket_count = (
+                calculate_random_upload_delay()
+            )
+            logger.info(
+                "当前窗口流量 API 上报随机分桶：bucket=%d/%d，窗口结束后延迟 %.3f 秒。",
+                upload_bucket_index,
+                upload_bucket_count,
+                upload_delay_seconds
+            )
+            sleep_until_upload_bucket(window_end, upload_delay_seconds)
+            logger.info(
+                "准备执行流量 API 上报，time_id=%d，记录数=%d",
+                window_start,
+                len(records)
+            )
+            upload_traffic_records(
+                records,
+                window_start,
+                traffic_upload_url,
+                is_compute_server_upload,
+                ip_address
+            )
+        except Exception:
+            logger.exception("后台流量上报任务异常，time_id=%d", window_start)
+        finally:
+            upload_queue.task_done()
+
+
 def process_window_records(
     window_start,
     prev_counters,
@@ -1561,11 +1610,10 @@ def process_window_records(
     elapsed,
     traffic_api_post,
     window_end,
-    traffic_upload_url,
-    is_compute_server_upload,
-    ip_address
+    upload_queue,
+    is_compute_server_upload
 ):
-    """处理单个统计窗口的记录生成、入库和可选 API 上报。
+    """处理单个统计窗口的记录生成、入库和可选后台上报入队。
 
     参数:
         window_start: 当前统计窗口开始时间戳，也是入库 time_id。
@@ -1574,9 +1622,8 @@ def process_window_records(
         elapsed: 两次采样之间的实际耗时，单位为秒。
         traffic_api_post: 是否开启 API 上报。
         window_end: 当前统计窗口结束时间戳。
-        traffic_upload_url: 流量上报接口 URL。
+        upload_queue: 后台上报使用的无界 Queue；未开启上报时为 None。
         is_compute_server_upload: 当前是否为算力服务器流量上报模式。
-        ip_address: 算力服务器流量上报使用的当前主机 IP。
 
     返回:
         list: 已生成并处理的数据库记录列表。
@@ -1639,34 +1686,14 @@ def process_window_records(
             )
             return records
 
-        upload_delay_seconds, upload_bucket_index, upload_bucket_count = (
-            calculate_random_upload_delay()
-        )
-        logger.info(
-            "当前窗口流量 API 上报随机分桶：bucket=%d/%d，窗口结束后延迟 %.3f 秒。",
-            upload_bucket_index,
-            upload_bucket_count,
-            upload_delay_seconds
-        )
-        sleep_until_upload_bucket(window_end, upload_delay_seconds)
-        logger.info(
-            "准备执行流量 API 上报，time_id=%d，记录数=%d",
-            window_start,
-            len(records)
-        )
-        upload_traffic_records(
-            records,
-            window_start,
-            traffic_upload_url,
-            is_compute_server_upload,
-            ip_address
-        )
+        upload_queue.put_nowait((records, window_start, window_end))
+        logger.info("流量 API 上报任务已入队，time_id=%d", window_start)
 
     return records
 
 
 def main(traffic_api_post, traffic_upload_url, ip_address):
-    """启动主循环并持续按固定窗口采样网卡流量。
+    """启动可选后台上报线程，并在主循环中按固定窗口采样网卡流量。
 
     参数:
         traffic_api_post: 是否开启流量 API 上报。
@@ -1697,6 +1724,17 @@ def main(traffic_api_post, traffic_upload_url, ip_address):
     else:
         logger.info("未开启流量 API 上报；如需开启，请使用 --traffic_api_post true。")
 
+    upload_queue = None
+    if traffic_api_post:
+        upload_queue = queue.Queue()
+        upload_thread = threading.Thread(
+            target=run_upload_worker,
+            args=(upload_queue, traffic_upload_url, is_compute_server_upload, ip_address),
+            name='traffic-upload'
+        )
+        upload_thread.daemon = True
+        upload_thread.start()
+
     startup_sample_time = time.time()
     window_start = current_aligned_window_start(startup_sample_time, INTERVAL)
     baseline_ts = int(window_start + INTERVAL)
@@ -1717,7 +1755,8 @@ def main(traffic_api_post, traffic_upload_url, ip_address):
     while True:
         target_ts = window_start + INTERVAL
         logger.info(
-            "等待窗口结束点（北京时间）: %s (窗口开始 time_id=%d)",
+            "采样等待：当前统计窗口 %s ~ %s（北京时间），将在窗口结束时采样，time_id=%d",
+            format_beijing_time(window_start),
             format_beijing_time(target_ts),
             window_start
         )
@@ -1733,9 +1772,8 @@ def main(traffic_api_post, traffic_upload_url, ip_address):
             elapsed,
             traffic_api_post,
             target_ts,
-            traffic_upload_url,
-            is_compute_server_upload,
-            ip_address
+            upload_queue,
+            is_compute_server_upload
         )
 
         prev_counters = cur_counters

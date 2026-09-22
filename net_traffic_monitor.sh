@@ -91,13 +91,15 @@ EOF
 
 sudo systemctl enable chronyd
 sudo systemctl restart chronyd
-sudo chronyc -a makestep
+# 允许接下来 3 次时钟更新在偏差超过 0.5 秒时直接校时。
+sudo chronyc -a makestep 0.5 3
 
-# 每秒检查一次，最多检查 5 次，要求剩余时间校正量不超过 0.5 秒。
-if sudo chronyc -a waitsync 5 0.5 0 1; then
+# 每秒检查一次，最多检查 60 次，等待初始采样和同步完成，要求剩余校正量不超过 0.5 秒。
+if sudo chronyc -a waitsync 60 0.5 0 1; then
     echo "==> Time synchronization succeeded: $(date '+%Y-%m-%d %H:%M:%S %Z %z')"
 else
-    echo "Warning: system time synchronization failed; continuing installation."
+    echo "Warning: time synchronization timed out; continuing installation."
+    sudo chronyc tracking || true
     sudo chronyc sources -v || true
 fi
 

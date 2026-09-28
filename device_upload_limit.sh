@@ -5,10 +5,10 @@
 # curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- -s 20 -e 22 -r 50mbit
 # curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- install-cron -s 20 -e 22 -r 50mbit
 # curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- remove-cron
-# sudo bash device_upload_limit.sh off
+# sudo bash device_upload_limit.sh off  # 仅解除当前限速；保留的定时任务可能再次设置限速。
 # sudo bash device_upload_limit.sh -s 20 -e 22 -r 50mbit
 # sudo bash device_upload_limit.sh install-cron -s 20 -e 22 -r 50mbit
-# sudo bash device_upload_limit.sh remove-cron
+# sudo bash device_upload_limit.sh remove-cron  # 删除定时任务并立即解除限速。
 
 # sudo crontab -l
 # sudo tail -n 100 /var/log/device_upload_limit.log

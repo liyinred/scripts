@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Author: wenhao
+# 功能：安装 frpc，创建 SSH 登录用户并启用密码登录，自动识别本机 SSH 端口。
+# 配置 SSH TCP 代理，并创建、启用和启动 frp_cool systemd 服务。
 # Example:
 # curl -fSL "https://gitee.com/liyinred/scripts/raw/master/install_frpc_ssh.sh" | sudo bash -s -- -s <ip> -n <name>
+# 服务状态查看命令:
+# systemctl status frp_cool
+# 日志查看命令:
+# journalctl -u frp_cool -f
 
 set -euo pipefail
 

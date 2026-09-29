@@ -18,9 +18,6 @@ SERVER_ADDR=""
 PROXY_NAME=""
 
 FRP_VERSION="0.68.1"
-FRP_TGZ="frp_${FRP_VERSION}_linux_amd64.tar.gz"
-FRP_DIR="frp_${FRP_VERSION}_linux_amd64"
-FRP_DOWNLOAD_URL="https://gh-proxy.org/https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${FRP_TGZ}"
 
 USERNAME="xiaohessh"
 PASSWORD='R7!qZ2@p'
@@ -193,6 +190,28 @@ if [[ -z "$PROXY_NAME" ]]; then
     exit 1
 fi
 
+# 将主机架构名称转换为 frp 发布包使用的架构名称。
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    x86_64|amd64)
+        FRP_ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        FRP_ARCH="arm64"
+        ;;
+    *)
+        echo "错误: 不支持的主机架构: $HOST_ARCH，仅支持 arm64/amd64" >&2
+        exit 1
+        ;;
+esac
+
+FRP_DIR="frp_${FRP_VERSION}_linux_${FRP_ARCH}"
+FRP_TGZ="${FRP_DIR}.tar.gz"
+FRP_RELEASE_URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${FRP_TGZ}"
+FRP_PROXY_URL="https://gh-proxy.org/${FRP_RELEASE_URL}"
+FRP_FALLBACK_URL="https://v4.gh-proxy.org/${FRP_RELEASE_URL}"
+echo "检测到主机架构: $HOST_ARCH，使用 frp ${FRP_VERSION} 的 ${FRP_ARCH} 版本"
+
 if ! command -v wget >/dev/null 2>&1; then
     echo "当前系统未安装 wget，正在尝试自动安装..."
 
@@ -251,7 +270,10 @@ fi
 # 下载并解压 frp
 # ==============================
 echo "开始下载 frp..."
-wget "$FRP_DOWNLOAD_URL"
+if ! wget --tries=1 -O "$FRP_TGZ" "$FRP_PROXY_URL"; then
+    echo "代理下载失败，尝试从 v4.gh-proxy.org 下载..."
+    wget --tries=1 -O "$FRP_TGZ" "$FRP_FALLBACK_URL"
+fi
 
 echo "开始解压 frp..."
 tar -xzf "$FRP_TGZ"

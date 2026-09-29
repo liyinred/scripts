@@ -620,7 +620,7 @@ def retry_api_log_entry(
     ip_address,
     error_logs=False
 ):
-    """解析单条历史日志并重报符合过滤规则的记录。
+    """解析单条历史日志，剔除负速率记录后重报有效记录。
 
     参数:
         entry_text: 单条 API 日志文本。
@@ -631,7 +631,7 @@ def retry_api_log_entry(
         error_logs: True 从异常日志取记录，False 根据普通日志查询 SQLite。
 
     返回:
-        bool: 重报成功或全部被过滤时返回 True；需保留原日志时返回 False。
+        bool: 重报成功或无有效记录时返回 True；需保留原日志时返回 False。
     """
     log_desc = 'API 异常日志' if error_logs else 'API 普通日志'
     try:
@@ -649,10 +649,20 @@ def retry_api_log_entry(
                 )
                 return False
 
-        upload_records = filter_upload_records_by_mode(records, is_compute_server_upload)
+        mode_records = filter_upload_records_by_mode(records, is_compute_server_upload)
+        upload_records = [
+            record for record in mode_records
+            if record[3] >= 0 and record[4] >= 0
+        ]
+        skipped_count = len(mode_records) - len(upload_records)
+        if skipped_count:
+            logger.warning(
+                '%s 重报已剔除负速率接口记录，time_id=%d，剔除数=%d',
+                log_desc, window_start, skipped_count
+            )
         if not upload_records:
             logger.info(
-                '%s 无需重报，已全部被接口过滤规则排除，文件=%s，time_id=%d',
+                '%s 无需重报，过滤后无有效记录，文件=%s，time_id=%d',
                 log_desc, log_path, window_start
             )
             return True
@@ -1447,7 +1457,7 @@ def build_record(window_start, iface, counter_deltas, elapsed):
         elapsed: 已校验为正数的两次采样实际耗时，单位为秒。
 
     返回:
-        tuple 或 None: 成功时返回待入库五元组；任一速率超过上限或
+        tuple 或 None: 成功时返回待入库五元组；任一速率为负数、超过上限或
         无法取得有效 MAC 时返回 None。
     """
     mac = get_collectible_mac(iface)
@@ -1460,6 +1470,16 @@ def build_record(window_start, iface, counter_deltas, elapsed):
 
     rx_speed = (float(rx_delta) * 8.0) / elapsed
     tx_speed = (float(tx_delta) * 8.0) / elapsed
+    if rx_speed < 0 or tx_speed < 0:
+        logger.warning(
+            "跳过网卡 %s 负速率记录，不入库且不上报："
+            "rx_speed=%.2f bps，tx_speed=%.2f bps。",
+            iface,
+            rx_speed,
+            tx_speed
+        )
+        return None
+
     if (
         rx_speed > MAX_TRAFFIC_SPEED_BPS
         or tx_speed > MAX_TRAFFIC_SPEED_BPS

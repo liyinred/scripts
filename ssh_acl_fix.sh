@@ -4,28 +4,9 @@ set -euo pipefail
 ALLOW=/etc/hosts.allow
 DENY=/etc/hosts.deny
 
-# SSH 白名单
-IPS=(
-    101.91.92.223
-    122.192.127.45
-    175.6.107.254
-    116.162.97.22
-    175.0.102.179
-    183.136.129.69
-    175.6.60.199
-    106.52.223.213
-    175.10.75.222
-    175.4.55.186
-    175.10.73.186
-    116.162.6.212
-    121.4.105.211
-)
-
-declare -A COMMENTS=(
-    [175.10.73.186]="办公室IP"
-    [116.162.6.212]="备份VPN"
-    [121.4.105.211]="新jump"
-)
+# SSH 白名单：每个位置参数传入一个 IPv4 地址。
+# 用法：sudo bash ssh_acl_fix.sh <IPv4> [IPv4 ...]
+IPS=("$@")
 
 declare -A EXPECT=() EXIST=()
 MISSING=() EXTRA=() DUP=()
@@ -41,9 +22,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+(($#)) || die "白名单为空；用法: sudo bash ssh_acl_fix.sh <IPv4> [IPv4 ...]"
 [[ $EUID -eq 0 ]] || die "请使用 root 执行"
 [[ -f $ALLOW && -f $DENY ]] || die "配置文件不存在"
-((${#IPS[@]})) || die "白名单为空"
 
 # 验证白名单
 for ip in "${IPS[@]}"; do
@@ -61,20 +42,11 @@ for ip in "${IPS[@]}"; do
     EXPECT[$ip]=1
 done
 
-# 功能：统一解析 SSH IPv4 允许规则；参数：文件路径、list 或 keep 模式；返回：输出 IP 或非托管内容。
+# 功能：解析 SSH IPv4 允许规则并保留原有注释；参数：文件路径、list 或 keep 模式；返回：输出 IP 或非托管内容。
 process_rules() {
-    printf '%s\n' ${COMMENTS[@]+"${COMMENTS[@]}"} | awk -F: -v mode="$2" '
-    FILENAME == "-" {
-        sub(/^[[:space:]]+/, "")
-        sub(/[[:space:]]+$/, "")
-        if (length($0)) managed[$0]=1
-        next
-    }
+    awk -F: -v mode="$2" '
     /^[[:space:]]*#/ {
-        comment=$0
-        sub(/^[[:space:]]*#[[:space:]]*/, "", comment)
-        sub(/[[:space:]]+$/, "", comment)
-        if (mode=="keep" && !(comment in managed)) print
+        if (mode=="keep") print
         next
     }
     {
@@ -87,7 +59,7 @@ process_rules() {
               ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)
         if (mode=="list" && rule) print ip
         if (mode=="keep" && !rule) print
-    }' - "$1"
+    }' "$1"
 }
 
 # 功能：按格式逐项输出 IP，空列表不输出；参数：printf 格式、IP 列表；返回：输出命令的状态码。
@@ -215,14 +187,12 @@ chown --reference="$ALLOW" "$TMP_A"
 chmod --reference="$DENY" "$TMP_D"
 chown --reference="$DENY" "$TMP_D"
 
-# 删除旧托管备注和 SSH IP 允许规则
+# 删除旧 SSH IP 允许规则
 process_rules "$ALLOW" keep > "$TMP_A"
 
 # 写入标准白名单
 printf '\n' >> "$TMP_A"
 for ip in "${IPS[@]}"; do
-    [[ -z ${COMMENTS[$ip]:-} ]] ||
-        printf '#%s\n' "${COMMENTS[$ip]}" >> "$TMP_A"
     printf 'sshd:%s:allow\n' "$ip" >> "$TMP_A"
 done
 

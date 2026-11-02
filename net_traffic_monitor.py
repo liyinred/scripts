@@ -289,7 +289,7 @@ def filter_upload_records(records):
 
 
 def build_traffic_payload(records, is_compute_server_upload=False, ip_address=None):
-    """将数据库记录转换为指定上报模式的 JSON 数组。
+    """构造上报 JSON 数组，普通模式按同窗口、同 MAC 汇总上下行速率。
 
     参数:
         records: 已过滤的记录列表，每项为 time_id、iface、mac、rx_speed、tx_speed。
@@ -297,10 +297,10 @@ def build_traffic_payload(records, is_compute_server_upload=False, ip_address=No
         ip_address: 算力服务器上报使用的当前主机 IP。
 
     返回:
-        list: 可序列化为 JSON 数组的流量上报数据。
+        list: 可序列化为 JSON 数组的数据；普通模式每个 time_id、MAC 仅一项。
     """
     identity_key = 'ip' if is_compute_server_upload else 'mac'
-    return [
+    payload = [
         {
             'time_id': LONG_TYPE(record[0]),
             identity_key: ip_address if is_compute_server_upload else record[2],
@@ -309,6 +309,22 @@ def build_traffic_payload(records, is_compute_server_upload=False, ip_address=No
         }
         for record in records
     ]
+    if is_compute_server_upload:
+        return payload
+
+    items_by_key = {}
+    merged_payload = []
+    for item in payload:
+        item['mac'] = item['mac'].strip().lower()
+        key = (item['time_id'], item['mac'])
+        existing_item = items_by_key.get(key)
+        if existing_item is None:
+            items_by_key[key] = item
+            merged_payload.append(item)
+        else:
+            existing_item['rx_speed'] += item['rx_speed']
+            existing_item['tx_speed'] += item['tx_speed']
+    return merged_payload
 
 
 def decode_response_body(response_body):

@@ -169,18 +169,20 @@ def run_command(command, allow_nonzero=False, error_label=None, env=None):
 def validate_upload_limit_config(start, end, rate):
     """校验后端下发的设备限速配置。
 
-    功能：确保开始小时、结束小时和速率均为安全的整数参数，并校验业务范围。
-    参数：start 为开始小时；end 为结束小时；rate 为限速速率，单位为 mbit。
-    返回值：tuple，依次包含校验后的 start、end 和 rate 整数。
+    功能：校验 HH:MM 时间和正整数速率，兼容旧版后端下发的整数小时。
+    参数：start 为开始时间；end 为结束时间；rate 为限速速率，单位为 mbit。
+    返回值：tuple，依次包含 HH:MM 格式的 start、end 和整数 rate。
     """
-    values = (start, end, rate)
-    if any(
-        isinstance(value, bool) or not isinstance(value, INTEGER_TYPES)
-        for value in values
-    ):
-        raise ValueError("限速配置必须为整数")
-    if not 0 <= start <= 23 or not 0 <= end <= 23:
-        raise ValueError("限速开始时间和结束时间必须为 0-23")
+    times = []
+    for value in (start, end):
+        if not isinstance(value, bool) and isinstance(value, INTEGER_TYPES) and 0 <= value <= 23:
+            value = "%02d:00" % value
+        if not isinstance(value, TEXT_TYPE) or not re.match(r"^([01][0-9]|2[0-3]):[0-5][0-9]\Z", value):
+            raise ValueError("限速开始时间和结束时间必须为 HH:MM 格式")
+        times.append(value)
+    start, end = times
+    if isinstance(rate, bool) or not isinstance(rate, INTEGER_TYPES):
+        raise ValueError("限速速率必须为整数")
     if start == end:
         raise ValueError("限速开始时间和结束时间不能相同")
     if rate <= 0:
@@ -188,13 +190,13 @@ def validate_upload_limit_config(start, end, rate):
     return start, end, rate
 
 
-def execute_upload_limit_command(enabled, start=20, end=22, rate=50):
+def execute_upload_limit_command(enabled, start="20:00", end="22:00", rate=50):
     """执行设备上行限速状态切换命令。
 
     功能：通过固定的 bash pipeline 安装或移除 device_upload_limit cron，并校验退出码；
         安装时将已校验配置填充到命令模板。
-    参数：enabled 为 True 时安装限速 cron，为 False 时移除限速 cron；start 为开始小时；
-        end 为结束小时；rate 为限速速率，单位为 mbit。
+    参数：enabled 为 True 时安装限速 cron，为 False 时移除限速 cron；start 为 HH:MM 开始时间；
+        end 为 HH:MM 结束时间；rate 为限速速率，单位为 mbit。
     返回值：dict，命令成功时返回空数据对象供 WebSocket 响应使用。
     """
     if enabled:

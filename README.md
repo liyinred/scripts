@@ -17,15 +17,13 @@
 | [hardware_check_report.sh](hardware_check_report.sh) | 汇总系统、CPU、内存、GPU、网卡及 SSD 信息，在符合空间条件的挂载点执行 fio 随机混合读写测试，输出硬件与 IOPS 报告 |
 | [install_frpc_ssh.sh](install_frpc_ssh.sh) | 按主机架构下载 frpc，识别本机 SSH 端口、配置登录账户与密码认证，生成穿透配置并注册开机服务 |
 | [install_show_qrcode.sh](install_show_qrcode.sh) | 根据 machine-id 派生设备 ID，安装小程序绑定二维码展示命令及开机服务，便于节点扫码绑定 |
-| [package_dist.py](package_dist.py) | 将相邻 `frontend/dist/` 构建产物压缩为 `dist.zip`，保留目录层级并原子替换旧压缩包，用于前端资源发布 |
 | [stress_test/](stress_test/) | 提供 Python asyncio 和 wrk / Lua 两种流量上报接口压测方案，模拟并发请求并统计吞吐量、状态码和延迟 |
 | [vitepress_project/](vitepress_project/) | 小合云 VitePress 帮助中心源码，包含用户协议、计费 SLA 和发票说明，支持静态站点构建、打包及同步至前端目录 |
-| `dist.zip` / `dist_docs.zip` | 分别保存前端页面与帮助中心的静态发布资源，供应用集成或静态站点部署 |
 
 ## 产物与文档站
 
-- `dist.zip`：由 `package_dist.py` 打包相邻 `frontend/dist/` 生成，压缩包保留 `dist/` 层级。
-- `dist_docs.zip`：帮助中心构建后的发布压缩包；静态文件位于 `vitepress_project/dist_docs/`，并同步至相邻 `frontend/dist_docs/`。
+- 前端 `dist.zip`：在相邻 `frontend/` 目录执行 `pnpm run build` 后，由 `frontend_scripts/post-build.mjs` 自动生成到 `frontend/dist.zip`，压缩包保留 `dist/` 层级。
+- 帮助中心 `dist_docs.zip`：构建后输出至相邻 `frontend/dist_docs.zip`；静态文件位于 `vitepress_project/dist_docs/`，并同步至相邻 `frontend/dist_docs/`。
 - 帮助中心：内容位于 `vitepress_project/docs/`，配置位于 `vitepress_project/docs/.vitepress/config.mts`，部署基础路径为 `/help/`。
 
 ## Git 提交与多远程同步

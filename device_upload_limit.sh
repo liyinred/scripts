@@ -2,12 +2,12 @@
 # Author: wenhao
 # Description: 在指定时间窗口应用 TBF 出口限速（指定端口除外），并在其他时间解除限速。
 # Example:
-# curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- -s 20 -e 22 -r 50mbit
-# curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- install-cron -s 20 -e 22 -r 50mbit
+# curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- -s 20:00 -e 22:00 -r 50mbit
+# curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- install-cron -s 20:00 -e 22:00 -r 50mbit
 # curl -fSL "https://gitee.com/liyinred/scripts/raw/master/device_upload_limit.sh" | sudo bash -s -- remove-cron
 # sudo bash device_upload_limit.sh off  # 仅解除当前限速；保留的定时任务可能再次设置限速。
-# sudo bash device_upload_limit.sh -s 20 -e 22 -r 50mbit
-# sudo bash device_upload_limit.sh install-cron -s 20 -e 22 -r 50mbit
+# sudo bash device_upload_limit.sh -s 20:00 -e 22:00 -r 50mbit
+# sudo bash device_upload_limit.sh install-cron -s 20:00 -e 22:00 -r 50mbit
 # sudo bash device_upload_limit.sh remove-cron  # 删除定时任务并立即解除限速。
 
 # sudo crontab -l
@@ -18,8 +18,10 @@ set -uo pipefail
 # cron 的默认 PATH 可能不包含 /usr/sbin，需确保能够找到 ip、tc 等系统命令。
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-START=20
-END=22
+START="20:00"
+END="22:00"
+START_MINUTES=1200
+END_MINUTES=1320
 RATE="50mbit"
 ROOT_QDISC_HANDLE="4915:"
 EXEMPT_CLASS_ID="4915:1"
@@ -52,21 +54,30 @@ check_requirements() {
     done
 }
 
+# 功能：将 HH:MM 时间转换为当天分钟数，兼容旧版整数小时参数。
+# 参数：$1 为 HH:MM 时间或 0-23 整数小时。
+# 返回值：成功时输出 0-1439 分钟数并返回 0，格式非法时返回 1。
+time_to_minutes() {
+    local value="$1"
+
+    if [[ "$value" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        printf '%s\n' "$((10#${value%:*} * 60 + 10#${value#*:}))"
+    elif [[ "$value" =~ ^([0-9]|[01][0-9]|2[0-3])$ ]]; then
+        printf '%s\n' "$((10#$value * 60))"
+    else
+        echo "Error: time must use HH:MM format (00:00-23:59)" >&2
+        return 1
+    fi
+}
+
 # 功能：校验限速时间窗口和限速速率参数。
 # 参数：使用全局变量 START、END 和 RATE。
 # 返回值：参数有效时返回 0，否则返回 1。
 validate_parameters() {
-    if ! [[ "$START" =~ ^[0-9]+$ ]] || ! [[ "$END" =~ ^[0-9]+$ ]]; then
-        echo "Error: START and END must be integers from 0 to 23" >&2
-        return 1
-    fi
+    START_MINUTES=$(time_to_minutes "$START") || return 1
+    END_MINUTES=$(time_to_minutes "$END") || return 1
 
-    if [ "$START" -gt 23 ] || [ "$END" -gt 23 ]; then
-        echo "Error: START and END must be integers from 0 to 23" >&2
-        return 1
-    fi
-
-    if [ "$START" -eq "$END" ]; then
+    if [ "$START_MINUTES" -eq "$END_MINUTES" ]; then
         echo "Error: START and END cannot be the same" >&2
         return 1
     fi
@@ -570,16 +581,16 @@ limit_on() {
     return "$failed"
 }
 
-# 功能：判断给定小时是否处于限速时间窗口，支持跨午夜窗口。
-# 参数：$1 为 0-23 的当前小时；时间窗口从全局变量 START、END 读取。
+# 功能：判断当天分钟数是否处于限速窗口，包含开始时刻、不包含结束时刻，支持跨午夜。
+# 参数：$1 为 0-1439 的当前分钟数；窗口从全局变量 START_MINUTES、END_MINUTES 读取。
 # 返回值：处于限速窗口时返回 0，否则返回 1。
-is_limited_hour() {
-    local current_hour="$1"
+is_limited_time() {
+    local current_minutes="$1"
 
-    if [ "$START" -lt "$END" ]; then
-        [ "$current_hour" -ge "$START" ] && [ "$current_hour" -lt "$END" ]
+    if [ "$START_MINUTES" -lt "$END_MINUTES" ]; then
+        [ "$current_minutes" -ge "$START_MINUTES" ] && [ "$current_minutes" -lt "$END_MINUTES" ]
     else
-        [ "$current_hour" -ge "$START" ] || [ "$current_hour" -lt "$END" ]
+        [ "$current_minutes" -ge "$START_MINUTES" ] || [ "$current_minutes" -lt "$END_MINUTES" ]
     fi
 }
 
@@ -587,7 +598,7 @@ is_limited_hour() {
 # 参数：接收脚本的全部命令行参数。
 # 返回值：操作成功时返回 0，参数、环境、cron 或 tc 操作失败时返回非 0。
 main() {
-    local current_hour
+    local current_minutes
 
     if [ "${1:-}" = "off" ]; then
         if [ "$#" -ne 1 ]; then
@@ -625,8 +636,8 @@ main() {
     validate_parameters || return 1
     check_requirements || return 1
 
-    current_hour=$((10#$(date +%H)))
-    if is_limited_hour "$current_hour"; then
+    current_minutes=$(time_to_minutes "$(date +%H:%M)") || return 1
+    if is_limited_time "$current_minutes"; then
         limit_on
     else
         limit_off
